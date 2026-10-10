@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="565" viewBox="0 0 1080 565" role="img" aria-labelledby="title desc">
+<title id="title">Software factory review and repair loop</title>
+<desc id="desc">Make a change, run checks, and review in a fresh session. Failed checks or review findings feed repairs and another pass. Verification requires passing checks, verified criteria, and no findings. Blockers, timeouts and no progress are incomplete outcomes.</desc>
+<defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 1 1 L 9 5 L 1 9" fill="none" stroke="#24384b" stroke-width="1.5"/></marker></defs>
+<rect width="1080" height="565" rx="16" fill="#ffffff"/>
+<g font-family="'Comic Sans MS', 'Trebuchet MS', sans-serif">
+<text x="40" y="55.0" font-size="30" fill="#24384b">Build. Check. Review. Repair.</text>
+<text x="40" y="91.0" font-size="18" fill="#24384b">For each task — and again after integration.</text>
+<path d="M52 155 Q40 154 40 167 L41 231 Q40 243 52 243 L213 242 Q225 243 225 231 L224 167 Q225 155 213 156 Z" fill="#e7efff" stroke="#24384b" stroke-width="2"/>
+<text x="58" y="202.0" font-size="22" fill="#24384b">Make a change</text>
+<path d="M317 155 Q305 154 305 167 L306 231 Q305 243 317 243 L443 242 Q455 243 455 231 L454 167 Q455 155 443 156 Z" fill="#e7efff" stroke="#24384b" stroke-width="2"/>
+<text x="323" y="202.0" font-size="22" fill="#24384b">Run checks</text>
+<path d="M547 155 Q535 154 535 167 L536 231 Q535 243 547 243 L723 242 Q735 243 735 231 L734 167 Q735 155 723 156 Z" fill="#f0eaff" stroke="#24384b" stroke-width="2"/>
+<text x="553" y="202.0" font-size="22" fill="#24384b">Fresh review</text>
+<path d="M847 155 Q835 154 835 167 L836 231 Q835 243 847 243 L1028 242 Q1040 243 1040 231 L1039 167 Q1040 155 1028 156 Z" fill="#def3e5" stroke="#24384b" stroke-width="2"/>
+<text x="853" y="202.0" font-size="22" fill="#24384b">Verified</text>
+<polyline points="225,199 300,199" fill="none" stroke="#24384b" stroke-width="2" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<polyline points="455,199 530,199" fill="none" stroke="#24384b" stroke-width="2" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<polyline points="735,199 830,199" fill="none" stroke="#24384b" stroke-width="2" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<text x="465" y="176.0" font-size="15" fill="#24384b">pass</text>
+<text x="747" y="166.0" font-size="15" fill="#24384b">no findings</text>
+<path d="M402 345 Q390 344 390 357 L391 421 Q390 433 402 433 L653 432 Q665 433 665 421 L664 357 Q665 345 653 346 Z" fill="#fff0d6" stroke="#24384b" stroke-width="2"/>
+<text x="408" y="392.0" font-size="22" fill="#24384b">Repair the findings</text>
+<polyline points="380,243 380,299 465,299 465,340" fill="none" stroke="#24384b" stroke-width="2" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<text x="275" y="282.0" font-size="16" fill="#24384b">check fails</text>
+<polyline points="635,243 635,340" fill="none" stroke="#24384b" stroke-width="2" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<text x="653" y="293.0" font-size="16" fill="#24384b">findings</text>
+<polyline points="390,389 132,389 132,249" fill="none" stroke="#24384b" stroke-width="2" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<text x="158" y="369.0" font-size="16" fill="#24384b">recheck the changed code</text>
+<text x="837" y="273.0" font-size="16" fill="#24384b">Checks pass.</text>
+<text x="837" y="293.8" font-size="16" fill="#24384b">Criteria verified.</text>
+<text x="837" y="314.6" font-size="16" fill="#24384b">No review findings.</text>
+<text x="40" y="498.0" font-size="18" fill="#24384b">Blocked, timed out, or no source progress? Report INCOMPLETE.</text>
+<text x="40" y="532.0" font-size="17" fill="#24384b">Fresh review = a new session without earlier review conclusions.</text>
+</g>
+</svg>

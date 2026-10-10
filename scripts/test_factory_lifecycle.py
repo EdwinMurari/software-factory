@@ -262,6 +262,49 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(sum(c['phase'] == 'implement' for c in self.f.calls()), 1)
         self.assertNotIn('repair', [c['phase'] for c in self.f.calls()])
 
+    def test_restart_repairs_invalid_worker_result_and_preserves_partial_work(self):
+        original = self.f.fake.read_text()
+        self.f.fake.write_text(original.replace(
+            "issues = []", "if phase == 'implement':\n    print('invalid result')\n    sys.exit()\nissues = []"))
+        self.register()
+        code, result = self.cli('continue', self.report)
+        self.assertNotEqual(code, 0)
+        self.assertIn('Cannot read JSON', result['reason'])
+        partial = json.loads(self.report.read_text())
+        task = Path(partial['tickets']['a']['repositories']['app']['worktree'])
+        self.assertEqual((task / 'a.txt').read_text(), 'persisted')
+        logs = {p: p.read_bytes() for p in (self.output / 'tasks').rglob('*.stdout')}
+        self.f.fake.write_text(original)
+        code, result = self.cli('continue', self.report)
+        self.assertEqual(code, 0, result)
+        self.assertEqual([c['phase'] for c in self.f.calls() if c['phase'] != 'final_review'],
+                         ['implement', 'repair', 'review'])
+        self.assertEqual((task / 'a.txt').read_text(), 'persisted')
+        self.assertEqual((task / 'fix.txt').read_text(), 'x')
+        for path, data in logs.items():
+            self.assertEqual(path.read_bytes(), data)
+
+    def test_restart_repairs_interrupted_worker_without_restarting_implementation(self):
+        original = self.f.fake.read_text()
+        self.f.fake.write_text(original.replace(
+            "issues = []", "if phase == 'implement': time.sleep(60)\nissues = []"))
+        self.f.plan['worker_timeout_seconds'] = 1
+        self.f.plan_path.write_text(json.dumps(self.f.plan))
+        self.register()
+        code, result = self.cli('continue', self.report)
+        self.assertNotEqual(code, 0)
+        self.assertIn('process timeout', result['reason'])
+        partial = json.loads(self.report.read_text())
+        task = Path(partial['tickets']['a']['repositories']['app']['worktree'])
+        self.assertEqual((task / 'a.txt').read_text(), 'persisted')
+        self.f.fake.write_text(original)
+        code, result = self.cli('continue', self.report)
+        self.assertEqual(code, 0, result)
+        self.assertEqual([c['phase'] for c in self.f.calls() if c['phase'] != 'final_review'],
+                         ['implement', 'repair', 'review'])
+        self.assertEqual((task / 'a.txt').read_text(), 'persisted')
+        self.assertEqual((task / 'fix.txt').read_text(), 'x')
+
     def test_no_progress_task_cannot_advance_on_unchanged_continuation(self):
         self.f.config(findings=True, no_progress=True)
         self.register()

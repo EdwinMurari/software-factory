@@ -559,18 +559,25 @@ class Controller:
     def recover_source_worker(self, phase, ticket):
         """Finish version-specific source bookkeeping after a persisted result."""
 
+    def pending_source_result(self, label):
+        pending = self.report.get("pending_source_worker")
+        if pending and pending["label"] == label:
+            for record in self.report["processes"][pending["process_index"]:]:
+                if (record["phase"] == label and record["status"] == "passed"
+                        and "result" in record and record["result"]["status"] != "blocked"):
+                    return record["result"]
+        return None
+
     def source_worker(self, phase, ticket, evidence):
         # The worker result is durable before the enclosing attempt is saved.
         # Retain the pre-dispatch content so a recovered repair is measured
         # against its actual starting source, not its completed source.
         pending = self.report.get("pending_source_worker")
         label = phase + ("-" + ticket["id"] if ticket else "")
-        if pending and pending["label"] == label:
-            for record in self.report["processes"][pending["process_index"]:]:
-                if (record["phase"] == label and record["status"] == "passed"
-                        and "result" in record and record["result"]["status"] != "blocked"):
-                    self.recover_source_worker(phase, ticket)
-                    return record["result"], pending["before"]
+        result = self.pending_source_result(label)
+        if result is not None:
+            self.recover_source_worker(phase, ticket)
+            return result, pending["before"]
         before = self.progress()
         self.report["pending_source_worker"] = {
             "label": label, "process_index": len(self.report["processes"]), "before": before}
@@ -590,7 +597,9 @@ class Controller:
             previous = state["attempts"][-1] if retained and state["attempts"] else None
             repairing = False
             pending = self.report.get("pending_source_worker")
-            if attempt == 0 and pending and pending["label"] in ("implement-" + ticket["id"], "repair-" + ticket["id"]):
+            if (attempt == 0 and pending
+                    and pending["label"] in ("implement-" + ticket["id"], "repair-" + ticket["id"])
+                    and self.pending_source_result(pending["label"]) is not None):
                 repairing = pending["label"].startswith("repair-")
                 result, before = self.source_worker("repair" if repairing else "implement", ticket, evidence)
             elif (attempt == 0 and previous and previous["worker"]["status"] == "complete"

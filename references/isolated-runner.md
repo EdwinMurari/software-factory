@@ -1,4 +1,4 @@
-# Version 2: investigate, decide, build
+# Recorded factory lifecycle (v2)
 
 The v2 runner uses Python 3.10+, POSIX and Git. It shares v1’s implementation, check, repair and fresh review loop. It adds read-only audit investigation, isolated task worktrees, named repositories and bounded parallel batches. No service, model gateway, scheduler or tracker is required.
 
@@ -104,8 +104,9 @@ These commands create a new disposable fixture, with a custom worker that writes
 ```sh
 python3 scripts/demo.py /tmp/factory-demo
 python3 scripts/factory.py validate /tmp/factory-demo/build.json
-python3 scripts/factory.py run /tmp/factory-demo/build.json --output-dir /tmp/factory-demo/build-run
-python3 scripts/factory.py status /tmp/factory-demo/build-run/report.json
+python3 scripts/factory.py register /tmp/factory-demo/build.json --output-dir /tmp/factory-demo/build-run
+python3 scripts/factory.py continue /tmp/factory-demo/build-run/report.json
+python3 scripts/factory.py complete /tmp/factory-demo/build-run/report.json
 python3 scripts/factory.py validate /tmp/factory-demo/audit.json
 python3 scripts/factory.py investigate /tmp/factory-demo/audit.json --output-dir /tmp/factory-demo/audit-run
 python3 scripts/factory.py status /tmp/factory-demo/audit-run/report.json
@@ -137,7 +138,9 @@ The fixture has a predetermined desired outcome and no product questions. Execut
 
 ## Execution and delivery
 
-`run` pins exact base SHAs and creates a generated integration branch/worktree per repository. It leaves the original checkout and branch unchanged. It takes advisory locks keyed to shared Git directories, so v1 and v2 runs, including runs from different worktrees, cannot race. Stable lock files are retained; process exit releases their locks.
+`register` records one run identity, its approved inputs and repository ownership before implementation. `continue REPORT` starts or resumes its existing loop. `run` remains a compatibility shortcut for register plus execution. A new output folder cannot bypass an incomplete registered run, including through a linked worktree or legacy build.
+
+Execution pins exact base SHAs and creates a generated integration branch/worktree per repository. It leaves the original checkout and branch unchanged. It takes advisory locks keyed to shared Git directories, so v1 and v2 runs, including runs from different worktrees, cannot race. Stable lock files are retained; process exit releases their locks.
 
 Ready task IDs are sorted into batches of at most `max_workers` (1–32, default 2). Each task gets its own branch and worktree in each participating repository. Tasks in a batch overlap; each implementation, repair and review uses a new CLI process. The coordinator waits for the batch, then integrates in stable ID order. Program Git mutations, including isolated task commits, are serialized. A dependency is ready only when all of its predecessor’s repositories have integrated. A blocked or failed task leaves dependants unrun; independent approved work continues in later batches. The report retains each task’s reason for not running.
 
@@ -149,6 +152,27 @@ One run deadline bounds all workers and checks. SIGINT, SIGTERM and SIGHUP cance
 
 A single main report links task logs, original baselines, decisions, point dispositions, dependencies, worktrees, branches, pinned SHAs, checks and reviews. It records final exact repository fingerprints and evidence-file hashes. `status` checks all source repositories, preserved worktrees, the plan, controller modules and referenced evidence. Missing or changed dependencies return stale. Ignored files, symlink targets outside source, environment and external services remain outside source fingerprint coverage; keep runtime checks uncached and preserve external inputs when relevant.
 
-Exit codes: `0` valid, investigated or verified; `1` incomplete or stale; `2` invalid input or setup error. An `investigated` report records coverage, including blocked points; it is not build success. Read dispositions and evidence, not only the exit code. A verified audit build lists approved deferrals separately from implemented tasks.
+Exit codes: `0` valid, registered, investigated, verified or explicitly closed; `1` incomplete or stale; `2` invalid input or setup error. An `investigated` report records coverage, including blocked points; it is not build success. Read dispositions and evidence, not only the exit code. A verified audit build lists approved deferrals separately from implemented tasks.
 
-All worktrees and local branches remain for inspection, including failures and cancellation. No resume, rollback, reset, clean, push, deployment or issue closing is performed. The persisted integration worktrees/commits are the result; original source branches are not delivery targets. Inspect the report and use the project’s authorized delivery process.
+All worktrees and local branches remain for inspection, including failures and cancellation. No rollback, reset, clean, push, deployment or issue closing is performed. The persisted integration worktrees/commits are the result; original source branches are not delivery targets. Inspect the report and use the project’s authorized delivery process.
+
+## Continue, reopen and complete
+
+Keep the report path returned by registration. Use these operations on that same report:
+
+```sh
+python3 scripts/factory.py continue /absolute/path/run/report.json
+python3 scripts/factory.py reopen /absolute/path/run/report.json --findings /absolute/path/findings.json
+python3 scripts/factory.py adopt /absolute/path/run/report.json --reason 'Retain the specified correction'
+python3 scripts/factory.py complete /absolute/path/run/report.json
+```
+
+Findings are a nonempty JSON array of concrete issue strings. Reopening dispatches repair, checks and fresh final review. Continuation restores task worktrees, attempts and logs. Integrated tasks stay integrated; a completed implementation can proceed to checks without being implemented again. Interrupted worker output without a valid result goes to repair. Each operation has a fresh bounded execution deadline. Existing checks and no-progress limits still apply.
+
+Ordinary continuation rejects unexplained worktree changes. Adoption records before/after fingerprints and retained content, then sends it through checks and fresh review. It preserves tracked and untracked edits. The original source checkout, plan, controller, requirements and decision files remain fixed inputs: adoption cannot change them. If they changed, preserve the edits separately and restore the approved inputs before continuing. This interface does not migrate a run to a changed product agreement. When the user explicitly ends or replaces the agreement, run `close REPORT --reason TEXT`. Closing preserves the old report, worktrees and evidence, records the reason, and releases only that run’s repository claims. It can close a run with changed fixed inputs. It never marks the work verified. Then register the newly agreed plan. A closed run cannot be continued.
+
+Repository locks are stable advisory locks, released on process exit. A persistent registry keeps ownership after interruption. If an interrupted worker PID is still alive, continuation stops until it exits. Missing worktrees, missing evidence or unfinished Git conflicts remain visible failures; nothing is reset to make recovery pass. Reports and historical operation snapshots remain in the run directory.
+
+`complete` is the single build completion gate used by run finalization and verified status. It checks the current integration content, required check coverage and process evidence, all acceptance IDs, fresh zero-finding review, integrated task ancestry, unresolved findings, product decisions, source inputs, plan, controller and evidence dependencies. Changing only a status string cannot satisfy it. The result is the recorded integration worktrees; the original branches are not delivery targets.
+
+These controls detect unsupported edits and stale evidence. They do not restrict filesystem permissions, authenticate reports, attest human approval or prove bug freedom. Ignored files, external symlink targets, hidden adapter state and external services remain outside source fingerprint coverage.

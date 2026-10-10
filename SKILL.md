@@ -21,11 +21,13 @@ Read [product-contract.md](references/product-contract.md) for new features, vag
 
 Completion of this stage means an implementer can distinguish the requested result from a plausible but wrong result. Treat unresolved material questions as blocked work, not implicit approval.
 
-## Choose the smallest useful loop
+## Enter or continue the recorded run
 
-- **Small change:** work in the current session. Use existing focused checks and inspect the result. A copy or style change does not need a ticket graph or new tests.
-- **Substantial change:** make small tasks that each deliver observable behaviour. Declare dependencies and acceptance criteria. Read [runner.md](references/runner.md) for v1 or [isolated-runner.md](references/isolated-runner.md) for v2 and use the on-demand runner for fresh worker sessions and deterministic checks. The runner is shared; commands and product requirements belong to the project.
-- **Factory worker:** if this session was launched for an assigned implementation, repair, or review stage, do that stage and return the requested result. Do not launch another factory or expand the ticket.
+- **Explicit factory request:** after product intake, use the v2 lifecycle in [isolated-runner.md](references/isolated-runner.md), even for one small task. Run `register` before application implementation, then `continue` the returned report. Keep that run identity through implementation, checks, reviews and repairs.
+- **Implicit small change:** work in the current session with focused checks and review. Substantial work uses the same v2 controller path.
+- **Factory worker:** do the assigned stage and return its result schema. The controller owns dispatch, checks, repairs, commits and completion. Do not launch another factory.
+
+After an interruption, continue the existing report. Submit late findings with `reopen`; record retained out-of-run edits with `adopt`. Both return work to the current verification loop. Changed requirements or decisions need a new explicit agreement; adoption accepts source edits only. When the user ends or replaces that agreement, use `close REPORT --reason TEXT` to preserve the incomplete run and release its repository claim before registering the new plan. Obtain completion from `complete`, then report the verified integration worktree and any remaining delivery action. Legacy v1 is retained for existing consumers; new explicit runs use v2.
 
 Read [quality.md](references/quality.md) when choosing tests, reviewing a change, or handling failed checks. Read [performance.md](references/performance.md) when the change affects responsiveness, caching, large data, background work, or CI cost.
 
@@ -35,7 +37,7 @@ Implement one behaviour at a time. For new logic or a bug fix, establish a usefu
 
 Map each acceptance criterion to observed evidence. An exit code proves only that the chosen command passed. Review whether the check exercises the intended behaviour. Missing runtime access, skipped checks, and a passing command that selected zero tests remain gaps.
 
-Review the complete change against both the product agreement and the project's standards. Include new and uncommitted files. Use a fresh reviewer session with no implementation conversation or earlier review conclusions. Give it the product contract, standards, baseline, current source, and check evidence. Repair findings within scope, rerun affected checks, and repeat fresh reviews until there are no remaining findings. A blocked or interrupted loop is incomplete. Check the combined result after tasks are integrated; individually correct changes can still conflict.
+For a controller run, let its fresh review stages review the complete change against both the product agreement and the project's standards. Include new and uncommitted files. Use a fresh reviewer session with no implementation conversation or earlier review conclusions. Give it the product contract, standards, baseline, current source, and check evidence. Repair findings within scope, rerun affected checks, and repeat fresh reviews until there are no remaining findings. A blocked or interrupted loop is incomplete. Check the combined result after tasks are integrated; individually correct changes can still conflict.
 
 For UI work, exercise the relevant interaction in the running app. For performance claims, compare the same workload before and after and preserve the behaviour. A proxy counter, screenshot, or mock response alone does not prove the user's outcome.
 

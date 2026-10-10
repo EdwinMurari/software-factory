@@ -515,16 +515,28 @@ class Controller:
         limit = self.plan.get("max_attempts")
         return range(limit) if limit is not None else itertools.count()
 
-    def run_ticket(self, ticket):
+    def run_ticket(self, ticket, resume=False):
         state = self.report["tickets"][ticket["id"]]
         evidence, seen = [], set()
+        retained = resume and bool(state["attempts"] or self.report["processes"])
+        if retained:
+            evidence = [{"continuation": "Continue retained work after interruption", "attempts": state["attempts"]}]
         for attempt in self.attempts():
             before = self.progress()
-            result = self.worker("implement" if attempt == 0 else "repair", ticket, evidence)
+            previous = state["attempts"][-1] if retained and state["attempts"] else None
+            if (attempt == 0 and previous and previous["worker"]["status"] == "complete"
+                    and not previous.get("review")
+                    and not any(c["status"] == "failed" for c in previous.get("checks", []))):
+                result = previous["worker"]
+            elif attempt == 0 and retained and state.get("status") == "verified":
+                return
+            else:
+                result = self.worker("implement" if attempt == 0 and not retained else "repair", ticket, evidence)
             after = self.inputs()
             progress = self.progress()
-            entry = {"number": attempt + 1, "worker": result, "inputs_sha256": after, "checks": [], "review": None}
+            entry = {"number": len(state["attempts"]) + 1, "worker": result, "inputs_sha256": after, "checks": [], "review": None}
             state["attempts"].append(entry)
+            self.save()
             if result["status"] == "blocked":
                 raise FactoryError(f"Ticket {ticket['id']} blocked: {result['summary']}")
             if attempt and (progress == before or progress in seen):
@@ -552,11 +564,22 @@ class Controller:
 
     def verify_integration(self):
         required = [c for tid in self.order for c in self.tickets[tid]["checks"]]
-        self.report["integration_attempts"] = []
+        self.report.setdefault("integration_attempts", [])
         seen, evidence = set(), []
+        previous = self.report["integration_attempts"][-1] if self.report["integration_attempts"] else None
+        if previous:
+            checks, review = previous.get("checks", []), previous.get("review")
+            # Retained repairs or adopted edits need new validation. Only require
+            # another source mutation when the failure describes today's inputs.
+            current = self.inputs()
+            same_inputs = checks and all(c.get("inputs_sha256") == current for c in checks)
+            if same_inputs and review and review["status"] == "changes_requested":
+                evidence = [{"review": review, "checks": self.failure_evidence(checks)}]
+            elif same_inputs and any(c["status"] == "failed" for c in checks):
+                evidence = self.failure_evidence(checks)
         for attempt in self.attempts():
             before = self.progress()
-            if attempt:
+            if attempt or evidence:
                 repair = self.worker("integration_repair", None, evidence)
                 if repair["status"] == "blocked":
                     raise FactoryError("Integration repair blocked: " + repair["summary"])
@@ -566,8 +589,9 @@ class Controller:
             seen.add(self.progress())
             checks = self.run_checks(required + self.plan["integration_checks"])
             self.report["final_checks"] = checks
-            entry = {"number": attempt + 1, "checks": checks, "review": None}
+            entry = {"number": len(self.report["integration_attempts"]) + 1, "checks": checks, "review": None}
             self.report["integration_attempts"].append(entry)
+            self.save()
             if any(c["status"] not in ("passed", "failed") for c in checks):
                 raise FactoryError("Final check interrupted, unavailable or changed source")
             if not all(c["status"] == "passed" for c in checks):
@@ -575,6 +599,7 @@ class Controller:
                 continue
             review = self.worker("final_review", None, self.failure_evidence(checks))
             entry["review"] = self.report["final_review"] = review
+            self.save()
             if self.review_complete(review):
                 break
             if review["status"] != "changes_requested":
@@ -594,6 +619,10 @@ class Controller:
                 os.close(lock_fd)
                 lock_fd = None
                 raise FactoryError(f"Another run holds repository lock: {lock}") from exc
+            common = (self.project / os.fsdecode(git(self.project, "rev-parse", "--git-common-dir")).strip()).resolve()
+            registry = common / "software-factory-active.json"
+            if registry.exists() and read_json(registry)["state"] not in ("complete", "closed"):
+                raise FactoryError("Existing active v2 run: " + read_json(registry)["report"])
             os.write(lock_fd, encoded({"pid": os.getpid(), "report": str(self.output / 'report.json')}))
             if self.plan.get("pending_decisions"):
                 raise FactoryError("Unresolved product decisions: " + "; ".join(self.plan["pending_decisions"]))
@@ -643,12 +672,19 @@ def report_status(path):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    for name in ("validate", "run", "investigate"):
+    for name in ("validate", "run", "register", "investigate"):
         command = commands.add_parser(name)
         command.add_argument("plan", type=Path)
-        if name in ("run", "investigate"):
+        if name in ("run", "register", "investigate"):
             command.add_argument("--output-dir", type=Path, help="Empty directory outside the source worktree")
     commands.add_parser("status").add_argument("report", type=Path)
+    for name in ("continue", "adopt", "reopen", "complete", "close"):
+        command = commands.add_parser(name)
+        command.add_argument("report", type=Path)
+        if name in ("adopt", "close"):
+            command.add_argument("--reason", required=True)
+        if name == "reopen":
+            command.add_argument("--findings", required=True, type=Path)
     args = parser.parse_args(argv)
     def terminated(signum, frame):
         raise KeyboardInterrupt("Received " + signal.Signals(signum).name)
@@ -658,6 +694,9 @@ def main(argv=None):
         if args.command == "validate":
             _, project, plan_hash, order = load_plan(args.plan)
             result = {"status": "valid", "project": str(project), "plan_sha256": plan_hash, "order": order}
+        elif args.command in ("continue", "adopt", "reopen", "complete", "close"):
+            from factory_lifecycle import operate
+            result = operate(args.report, args.command, getattr(args, "reason", None), getattr(args, "findings", None))
         elif args.command == "status":
             result = report_status(args.report)
         else:
@@ -667,15 +706,15 @@ def main(argv=None):
             if selected.get("version") == 2:
                 from factory_v2 import ControllerV2
                 controller = ControllerV2(args.plan, args.output_dir, investigate=args.command == "investigate")
-            elif args.command == "investigate":
-                raise FactoryError("investigate requires a version 2 audit input")
+            elif args.command in ("investigate", "register"):
+                raise FactoryError("investigate/register requires version 2")
             else:
                 controller = Controller(args.plan, args.output_dir)
-            report = controller.run()
+            report = controller.run(action="register") if args.command == "register" else controller.run()
             result = {"status": report["status"], "reason": report.get("reason"),
                       "report": str(controller.output / "report.json"), "claim": report["claim"]}
         print(json.dumps(result, indent=2))
-        return 0 if result["status"] in ("valid", "verified", "investigated") else 1
+        return 0 if result["status"] in ("valid", "verified", "investigated", "registered", "closed") else 1
     except (FactoryError, OSError, KeyError, ValueError) as exc:
         print(json.dumps({"status": "invalid", "reason": str(exc)}, indent=2))
         return 2

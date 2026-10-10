@@ -7,6 +7,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -283,13 +284,13 @@ class IsolatedTests(unittest.TestCase):
         with self.assertRaisesRegex(factory.FactoryError,'questions lack'):
             factory_v2.load_plan(self.plan_path)
         self.plan = copy.deepcopy(original)
+        _,r = self.run_factory(output='approved')
+        self.assertEqual(r['status'],'verified',r.get('reason'))
         self.plan['decisions'][0] = {'id':'choice-p','status':'pending'}
         _,r = self.run_factory(output='pending')
         self.assertEqual(r['status'],'incomplete')
         self.assertIn('Unresolved product decision',r['reason'])
         self.plan = original
-        _,r = self.run_factory(output='approved')
-        self.assertEqual(r['status'],'verified',r.get('reason'))
         (self.repo/'new-source.txt').write_text('stale')
         self.plan_path.write_text(json.dumps(self.plan))
         with self.assertRaisesRegex(factory.FactoryError,'fingerprint is stale'):
@@ -368,9 +369,12 @@ class IsolatedTests(unittest.TestCase):
         c = factory_v2.ControllerV2(self.plan_path, self.base / 'output')
         original = factory_v2.repository_inputs
         changed = False
+        verified_evidence = {}
         def concurrent_change(repositories):
             nonlocal changed
             if c.report['status'] == 'verified' and repositories == c.integration and not changed:
+                verified_evidence.update({key: copy.deepcopy(c.report[key])
+                                          for key in ('final_inputs', 'final_checks', 'final_review')})
                 (next(iter(repositories.values())) / 'late-change.txt').write_text('changed after verification')
                 changed = True
             return original(repositories)
@@ -378,9 +382,17 @@ class IsolatedTests(unittest.TestCase):
             r = c.run()
         self.assertTrue(changed)
         self.assertEqual(r['status'], 'incomplete')
-        self.assertIn('finalization', r['reason'])
+        self.assertIn('adopt', r['reason'])
+        for key, value in verified_evidence.items():
+            self.assertEqual(r[key], value, key)
+        self.assertEqual((next(iter(c.integration.values())) / 'late-change.txt').read_text(),
+                         'changed after verification')
         self.assertNotEqual(r['final_inputs'], original(c.integration))
-        self.assertEqual(factory.report_status(c.output / 'report.json')['status'], 'incomplete')
+        report_path = c.output / 'report.json'
+        self.assertEqual(json.loads(report_path.read_text())['status'], 'incomplete')
+        status = factory.report_status(report_path)
+        self.assertEqual(status['status'], 'stale')
+        self.assertFalse(status['fresh'])
 
     def test_worktree_from_same_repository_cannot_bypass_another_run_lock(self):
         linked = self.base / 'linked'
@@ -422,6 +434,34 @@ class IsolatedTests(unittest.TestCase):
         self.assertTrue(any(p['status']=='timeout' for p in r['tickets']['a']['processes']))
         self.assert_stopped(int((self.base/'a.child').read_text()))
 
+    def test_cancellation_has_one_cleanup_owner_and_preserves_checkpoint(self):
+        self.config(wait=True)
+        self.plan_path.write_text(json.dumps(self.plan))
+        owner = factory_v2.ControllerV2(self.plan_path, self.base / 'output')
+
+        def cancel_started_worker():
+            deadline = time.monotonic() + 10
+            while not (self.base / 'a.child').exists() and time.monotonic() < deadline:
+                time.sleep(.02)
+            owner.runtime.stop()
+
+        canceller = threading.Thread(target=cancel_started_worker)
+        with patch.object(factory_v2, 'kill_group', wraps=factory_v2.kill_group) as cleanup:
+            canceller.start()
+            try:
+                result = owner.run()
+            finally:
+                canceller.join(timeout=12)
+        self.assertFalse(canceller.is_alive())
+        self.assertTrue((self.base / 'a.child').exists())
+        self.assertEqual(result['status'], 'incomplete')
+        worker_pid = int((self.base / 'a.started').read_text())
+        self.assertEqual(sum(call.args[0].pid == worker_pid for call in cleanup.call_args_list), 1)
+        task = Path(result['tickets']['a']['repositories']['app']['worktree'])
+        self.assertEqual((task / 'a.txt').read_text(), 'persisted')
+        self.assertEqual(result['observed_worktree_inputs'][str(task)], factory.snapshot(task))
+        self.assert_stopped(int((self.base / 'a.child').read_text()))
+
     def test_cancel_parallel_workers_and_release_repository_locks(self):
         self.plan['tickets']=[self.ticket('a'),self.ticket('b')]
         self.config(wait=True,overlap=True)
@@ -451,13 +491,21 @@ class IsolatedTests(unittest.TestCase):
             r=json.loads((output/'report.json').read_text())
             self.assertEqual(r['status'],'incomplete')
             self.assertIn('SIGTERM',r['reason'])
+            run_id = r['run_id']
+            logs = {p: p.read_bytes() for p in (output / 'tasks').rglob('*.stderr')}
             for tid in ('a','b'):
+                task = Path(r['tickets'][tid]['repositories']['app']['worktree'])
+                self.assertEqual((task / (tid + '.txt')).read_text(), 'persisted')
+                self.assertEqual(r['observed_worktree_inputs'][str(task)], factory.snapshot(task))
                 self.assert_stopped(int((self.base/(tid+'.child')).read_text()))
             # Advisory locks are released while retained lock files prevent unlink races.
             self.config()
-            self.plan['tickets']=[self.ticket('a')]
-            _,r=self.run_factory(output='after-cancel')
+            from factory_lifecycle import operate
+            r = operate(output / 'report.json', 'continue')
             self.assertEqual(r['status'],'verified',r.get('reason'))
+            self.assertEqual(r['run_id'], run_id)
+            for path, content in logs.items():
+                self.assertEqual(path.read_bytes(), content)
         finally:
             if proc.poll() is None: proc.kill();proc.wait()
 

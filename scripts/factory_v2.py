@@ -15,7 +15,7 @@ import uuid
 
 from factory import (Controller, FactoryError, capture_baseline, digest, encoded, git,
                      identifier, keys, kill_group, now, positive, read_json, snapshot,
-                     strings, text, validate_v1, repository_lock_path)
+                     strings, text, validate_v1, validate_result, repository_lock_path)
 from factory_audit import (INVESTIGATION_SCHEMA, audit_input, execution_intake,
                            investigation_result, reference, references_unchanged)
 
@@ -26,7 +26,7 @@ def repository_inputs(repositories):
 
 def controller_hash():
     return digest(encoded({name: digest(Path(__file__).with_name(name).read_bytes())
-                           for name in ("factory.py", "factory_v2.py", "factory_audit.py")}))
+                           for name in ("factory.py", "factory_v2.py", "factory_audit.py", "factory_lifecycle.py")}))
 
 
 def common_directory(project):
@@ -131,20 +131,16 @@ def load_plan(path, investigate=False):
 
 
 class Runtime:
-    """One deadline, cancellation flag and active process registry for the run."""
+    """One deadline and cancellation flag for the run."""
     def __init__(self, deadline):
         self.deadline = deadline
         self.cancelled = threading.Event()
         self.mutex = threading.Lock()
         self.git_mutex = threading.Lock()
-        self.active = set()
 
     def stop(self):
-        self.cancelled.set()
         with self.mutex:
-            processes = list(self.active)
-        for proc in processes:
-            kill_group(proc)
+            self.cancelled.set()
 
 
 class Session(Controller):
@@ -163,7 +159,24 @@ class Session(Controller):
         self.order = list(self.tickets)
         self.sequence, self.cache = 0, {}
         self.report = {"tickets": {tid: {"status": "pending", "attempts": []} for tid in self.order},
-                       "processes": [], "baseline": baseline, "final_checks": [], "final_review": None}
+                       "processes": [], "baseline": baseline, "final_checks": [], "final_review": None,
+                       "observed_inputs": self.expected_inputs()}
+
+    def expected_inputs(self):
+        from factory_lifecycle import retained_inputs
+        expected = retained_inputs(self.owner, checkpoints=True)
+        return {name: (self.owner.source_inputs[name] if path == self.owner.sources.get(name)
+                       else expected[str(path)]) for name, path in self.repositories.items()}
+
+    def restore(self):
+        path = self.output / "report.json"
+        if path.exists():
+            self.report = read_json(path)
+            self.sequence = len(self.report["processes"])
+        # A controlled merge or recorded adoption can supersede an older final
+        # session. Resolve that checkpoint from controller evidence, never live edits.
+        self.report["observed_inputs"] = self.expected_inputs()
+        return self
 
     def adapter_directories(self):
         return [p for p in self.repositories.values() if p != self.project]
@@ -183,7 +196,10 @@ class Session(Controller):
         self.plan_unchanged()
         if self.runtime.cancelled.is_set():
             raise FactoryError("Run cancelled")
-        before = self.inputs()
+        before_inputs = repository_inputs(self.repositories)
+        before = digest(encoded(before_inputs))
+        if before_inputs != self.report["observed_inputs"]:
+            raise FactoryError("Unaccounted worktree edits; use adopt REPORT --reason TEXT to record retained edits and rerun checks and fresh review")
         available = min(timeout, self.deadline - time.monotonic())
         if available <= 0:
             raise FactoryError("Run wall-clock budget exhausted")
@@ -191,20 +207,21 @@ class Session(Controller):
         stem = f"{self.sequence:03d}-{label}"
         out, err = self.output / (stem + ".stdout"), self.output / (stem + ".stderr")
         record = {"argv": argv, "phase": label, "stdout": str(out), "stderr": str(err),
-                  "inputs_sha256": before, "repository_inputs": repository_inputs(self.repositories),
+                  "inputs_sha256": before, "repository_inputs": before_inputs,
                   "started_at_aest": now(), "status": "incomplete", "cwd": str(cwd or self.project)}
         self.report["processes"].append(record)
         self.save()
         proc = None
         try:
             with out.open("wb") as stdout, err.open("wb") as stderr:
-                # Registration and cancellation share a mutex: cancellation cannot miss a new process.
+                # Do not start a process after cancellation. Its session owns cleanup.
                 with self.runtime.mutex:
                     if self.runtime.cancelled.is_set():
                         raise FactoryError("Run cancelled")
                     proc = subprocess.Popen(argv, cwd=cwd or self.project, stdin=subprocess.PIPE,
                                             stdout=stdout, stderr=stderr, start_new_session=True)
-                    self.runtime.active.add(proc)
+                    record["pid"] = proc.pid
+                    self.save()
                 end = time.monotonic() + available
                 first = True
                 while True:
@@ -217,18 +234,16 @@ class Session(Controller):
                         first = False
                         if self.runtime.cancelled.is_set() or time.monotonic() >= end:
                             record["status"] = "cancelled" if self.runtime.cancelled.is_set() else "timeout"
-                            kill_group(proc)
-                            record["exit_code"] = proc.returncode
                             break
         except OSError as exc:
             record["error"] = str(exc)
         finally:
             if proc is not None:
                 kill_group(proc)
-                with self.runtime.mutex:
-                    self.runtime.active.discard(proc)
+                record["exit_code"] = proc.returncode
             record["finished_at_aest"] = now()
-            record["after_inputs_sha256"] = self.inputs()
+            self.report["observed_inputs"] = repository_inputs(self.repositories)
+            record["after_inputs_sha256"] = digest(encoded(self.report["observed_inputs"]))
             if readonly and before != record["after_inputs_sha256"]:
                 record["status"] = "source_changed"
             self.save()
@@ -272,6 +287,11 @@ class Session(Controller):
                 "-c", "user.email=software-factory@localhost", "-c", "commit.gpgSign=false",
                 "-c", "merge.gpgSign=false", "-c", "rerere.enabled=false", "-C", str(path), *args]
         with self.runtime.git_mutex:
+            if path not in self.repositories.values():
+                from factory_lifecycle import retained_inputs
+                expected = retained_inputs(self.owner, checkpoints=True)
+                if snapshot(path) != expected.get(str(path)):
+                    raise FactoryError("Unaccounted worktree edits; use adopt REPORT --reason TEXT to record retained edits and rerun checks and fresh review")
             record = self.execute(argv, "git-" + args[0], 30)
         if record["status"] != "passed" and not (allow_failure and record["status"] == "failed"):
             raise FactoryError(f"Git {args[0]} {record['status']}; inspect preserved logs")
@@ -288,7 +308,7 @@ class Session(Controller):
 
 
 class ControllerV2:
-    def __init__(self, plan_path, output_dir=None, investigate=False):
+    def __init__(self, plan_path, output_dir=None, investigate=False, resume=False):
         self.plan_path = Path(plan_path).resolve()
         self.plan, self.sources, self.plan_hash, self.order = load_plan(self.plan_path, investigate)
         self.investigate = investigate
@@ -299,7 +319,7 @@ class ControllerV2:
                for ref in self.plan["_dependencies"] + [{"path": str(self.plan_path)}]):
             raise FactoryError("Output must not contain plan or evidence dependencies")
         self.output.mkdir(parents=True, exist_ok=True)
-        if any(self.output.iterdir()):
+        if not resume and any(self.output.iterdir()):
             raise FactoryError("Output directory must be empty")
         self.runtime = Runtime(time.monotonic() + self.plan.get("run_timeout_seconds", 7200))
         self.source_inputs = self.plan["_source_inputs"]
@@ -307,7 +327,10 @@ class ControllerV2:
         self.code_hash = controller_hash()
         self.run_id = uuid.uuid4().hex
         self.locks, self.integration, self.sessions = [], {}, {}
-        self.report = {"version": 2, "mode": "investigate" if investigate else "build", "status": "incomplete",
+        self.resuming = resume
+        self.acquired = False
+        self.operation_ready = False
+        self.report = {"version": 2, "run_id": self.run_id, "mode": "investigate" if investigate else "build", "status": "incomplete",
                        "started_at_aest": now(), "plan_path": str(self.plan_path), "plan_sha256": self.plan_hash,
                        "controller_sha256": self.code_hash, "source_inputs": self.source_inputs,
                        "source_repositories": {n: str(p) for n, p in self.sources.items()},
@@ -322,6 +345,15 @@ class ControllerV2:
                                points=[], investigations=[])
         else:
             self.report["intake"] = self.plan["_intake"]
+        if resume:
+            self.report = read_json(self.output / "report.json")
+            self.run_id = self.report["run_id"]
+            self.plan_hash = self.report["plan_sha256"]
+            self.code_hash = self.report["controller_sha256"]
+            self.source_inputs = self.report["source_inputs"]
+            self.source_branches = self.report["source_branches"]
+            self.integration = {n: Path(r["worktree"]) for n, r in self.report["repositories"].items()}
+        self.opened_report_hash = digest(encoded(self.report)) if resume else None
 
     def save(self):
         target = self.output / "report.json"
@@ -340,7 +372,7 @@ class ControllerV2:
             raise FactoryError("Starting source checkout changed; evidence invalid")
 
     def acquire(self):
-        for path in sorted({lock_path(p) for p in self.sources.values()}):
+        for path in [self.output / ".operation.lock", *sorted({lock_path(p) for p in self.sources.values()})]:
             # Advisory lock file remains stable. Unlinking it creates a race with waiting openers.
             stream = path.open("a+b")
             try:
@@ -349,14 +381,49 @@ class ControllerV2:
                 stream.close()
                 raise FactoryError(f"Another factory run holds repository lock: {path}") from exc
             self.locks.append(stream)
+        # Construction happens before locking. Reject a delayed opener before it
+        # can replace newer evidence or claims with its previously read state.
+        report_path = self.output / "report.json"
+        current_report_hash = digest(encoded(read_json(report_path))) if report_path.exists() else None
+        if current_report_hash != self.opened_report_hash:
+            raise FactoryError("Report changed before lifecycle locks were acquired; retry the operation using the current report")
         self.unchanged()
+        from factory_lifecycle import claim_run
+        if not self.investigate:
+            claim_run(self)
+        self.acquired = True
 
-    def baseline(self, repositories, directory):
+    def baseline(self, repositories, directory, starting=None):
         records = {}
         for name, path in repositories.items():
             target = directory / name
             target.mkdir(parents=True, exist_ok=True)
-            records[name] = capture_baseline(path, target)
+            if starting is None:
+                # Persist each completed capture independently. A partial attempt
+                # stays intact and cannot be mistaken for a completed baseline.
+                from factory_lifecycle import atomic
+                checkpoint = target / "captures.json"
+                saved = read_json(checkpoint) if checkpoint.exists() else {"attempts": []}
+                if "baseline" not in saved:
+                    attempt = target / str(len(saved["attempts"]) + 1)
+                    saved["attempts"].append(str(attempt))
+                    atomic(checkpoint, saved)
+                    attempt.mkdir()
+                    saved["baseline"] = capture_baseline(path, attempt)
+                    atomic(checkpoint, saved)
+                records[name] = saved["baseline"]
+            else:
+                # Task worktrees start clean at a pinned commit. Rebuild only that
+                # baseline after interruption, never from later retained edits.
+                baseline = target / "baseline"
+                baseline.mkdir(exist_ok=True)
+                patch = baseline / "tracked.patch"
+                if patch.exists() and patch.read_bytes():
+                    raise FactoryError("Clean task baseline contains unexpected edits")
+                patch.write_bytes(b"")
+                records[name] = {"head": starting["repositories"][name]["base_sha"],
+                                 "inputs_sha256": starting["inputs"][name],
+                                 "tracked_patch": str(patch), "untracked": []}
         return records
 
     def worktree(self, name, source, role, base):
@@ -366,10 +433,16 @@ class ControllerV2:
         branch = f"factory/{self.run_id}/{role}/{name}"
         path = self.output / "worktrees" / role / name
         path.parent.mkdir(parents=True, exist_ok=True)
+        for setup in self.report.get("worktree_setups", []):
+            if setup["repo"] == name and setup["role"] == role and path.exists():
+                if os.fsdecode(git(path, "rev-parse", "--abbrev-ref", "HEAD")).strip() != branch:
+                    raise FactoryError("Retained worktree branch changed")
+                return path, {key: setup[key] for key in ("branch", "worktree", "base_sha")}
         # All mutations occur on the coordinator thread, except isolated task commits.
         helper = Session(self, {name: source}, self.output / "setup" / role / name, [], {})
         record = {"branch": branch, "worktree": str(path), "base_sha": base}
-        setup = {"repo": name, "role": role, **record, "status": "pending", "report": str(helper.output / "report.json")}
+        setup = {"repo": name, "role": role, **record, "status": "pending", "report": str(helper.output / "report.json"),
+                 "base_inputs": snapshot(self.integration[name] if role.startswith("task-") else source)}
         self.report.setdefault("worktree_setups", []).append(setup)
         self.save()
         try:
@@ -387,6 +460,8 @@ class ControllerV2:
             if git(source, "status", "--porcelain", "--untracked-files=all"):
                 raise FactoryError(f"Dirty source repository {name}: preserve or commit its changes before isolated build; investigation accepts working changes")
         for name, source in self.sources.items():
+            if name in self.integration:
+                continue
             base = os.fsdecode(git(source, "rev-parse", "HEAD")).strip()
             path, record = self.worktree(name, source, "integration", base)
             self.integration[name] = path
@@ -395,19 +470,47 @@ class ControllerV2:
 
     def task_session(self, ticket):
         repositories, records = {}, {}
-        for name in sorted(ticket["repos"]):
-            base = os.fsdecode(git(self.integration[name], "rev-parse", "HEAD")).strip()
-            path, record = self.worktree(name, self.sources[name], "task-" + ticket["id"], base)
-            repositories[name], records[name] = path, record
+        existing = self.report["tickets"][ticket["id"]].get("repositories")
+        if existing:
+            repositories = {n: Path(r["worktree"]) for n, r in existing.items()}
+            output = self.output / "tasks" / ticket["id"]
+            previous = read_json(output / "report.json")
+            return Session(self, repositories, output, [ticket], previous["baseline"]).restore()
+        state = self.report["tickets"][ticket["id"]]
+        setup = state.get("setup")
+        if setup:
+            records = setup["repositories"]
+            repositories = {n: Path(r["worktree"]) for n, r in records.items()}
+        else:
+            for name in sorted(ticket["repos"]):
+                base = os.fsdecode(git(self.integration[name], "rev-parse", "HEAD")).strip()
+                path, record = self.worktree(name, self.sources[name], "task-" + ticket["id"], base)
+                repositories[name], records[name] = path, record
+            retained = [r for r in self.report["worktree_setups"] if r["role"] == "task-" + ticket["id"]]
+            pinned = {r["repo"]: r["base_inputs"] for r in retained}
+            setup = {"repositories": records, "inputs": pinned,
+                     "adopted_inputs": {r["repo"]: r.get("adopted_inputs", r["base_inputs"]) for r in retained}}
+            state["setup"] = setup
+            self.save()
         output = self.output / "tasks" / ticket["id"]
-        output.mkdir(parents=True)
-        session = Session(self, repositories, output, [ticket], self.baseline(repositories, output))
-        self.report["tickets"][ticket["id"]]["repositories"] = records
+        output.mkdir(parents=True, exist_ok=True)
+        if (output / "report.json").exists():
+            previous = read_json(output / "report.json")
+            session = Session(self, repositories, output, [ticket], previous["baseline"]).restore()
+        else:
+            session = Session(self, repositories, output, [ticket], self.baseline(repositories, output, setup))
+            session.save()
+        state["repositories"] = records
+        self.save()
         return session
 
     def run_task(self, ticket, session):
         try:
-            session.run_ticket(ticket)
+            if session.report.get("adopted_pending_commit"):
+                session.commit_all("Factory adopt: " + ticket["id"])
+                session.report.pop("adopted_pending_commit")
+                session.save()
+            session.run_ticket(ticket, resume=self.resuming)
             return None
         except (FactoryError, OSError) as exc:
             return str(exc)
@@ -439,7 +542,7 @@ class ControllerV2:
         for name, path in session.repositories.items():
             commit = os.fsdecode(git(path, "rev-parse", "HEAD")).strip()
             session.git_operation(self.integration[name], "merge", "--ff-only", commit)
-            self.report["repositories"][name]["head"] = commit
+            self.report["repositories"][name].update(head=commit, inputs=session.report["observed_inputs"][name])
         self.report["tickets"][tid]["status"] = "integrated"
         self.report["integration_order"].append(tid)
         self.save()
@@ -453,7 +556,8 @@ class ControllerV2:
                 self.report["tickets"][tid].update(status="not_run", reason="; ".join(reasons))
         self.prepare()
         tickets = {t["id"]: t for t in self.plan["tickets"]}
-        remaining = {tid for tid in tickets if not intake["task_blockers"].get(tid)}
+        remaining = {tid for tid in tickets if not intake["task_blockers"].get(tid)
+                     and self.report["tickets"][tid]["status"] != "integrated"}
         while remaining:
             ready = sorted(tid for tid in remaining if all(self.report["tickets"][d]["status"] == "integrated"
                                                          for d in tickets[tid]["depends_on"]))
@@ -496,12 +600,21 @@ class ControllerV2:
         if failures or intake["blockers"]:
             raise FactoryError("Task incomplete: " + "; ".join(intake["blockers"] + failures))
         final_output = self.output / "final"
-        final_output.mkdir()
+        final_output.mkdir(exist_ok=True)
         # Review from original baselines, not task histories or intermediate conclusions.
-        baseline = self.baseline(self.sources, self.output / "original-baselines")
-        final = Session(self, self.integration, final_output, self.plan["tickets"], baseline)
+        saved_final = final_output / "report.json"
+        baseline = (read_json(saved_final)["baseline"] if saved_final.exists()
+                    else self.baseline(self.sources, self.output / "original-baselines"))
+        final = Session(self, self.integration, final_output, self.plan["tickets"], baseline).restore()
         self.final_session = final
+        pending = [item for item in self.report.get("findings", []) if not item.get("resolved")]
+        if pending:
+            repair = final.worker("integration_repair", None, pending)
+            if repair["status"] == "blocked":
+                raise FactoryError("Late finding repair blocked: " + repair["summary"])
         final.verify_integration()
+        for item in pending:
+            item["resolved"] = True
         self.unchanged()
         exact = repository_inputs(self.integration)
         fingerprint = digest(encoded(exact))
@@ -510,7 +623,8 @@ class ControllerV2:
         self.report.update(final_inputs=exact, final_checks=final.report["final_checks"], final_review=final.report["final_review"],
                            integration_attempts=final.report["integration_attempts"], final_processes=final.report["processes"], status="verified")
         for name, path in self.integration.items():
-            self.report["repositories"][name]["head"] = os.fsdecode(git(path, "rev-parse", "HEAD")).strip()
+            self.report["repositories"][name].update(
+                head=os.fsdecode(git(path, "rev-parse", "HEAD")).strip(), inputs=exact[name])
 
     def investigate_points(self):
         audit = self.plan["_audit"]
@@ -541,9 +655,15 @@ class ControllerV2:
         self.unchanged()
         self.report["status"] = "investigated"
 
-    def run(self):
+    def run(self, action="continue", reason=None, findings=None):
         try:
             self.acquire()
+            from factory_lifecycle import prepare_operation
+            prepare_operation(self, action, reason, findings)
+            self.operation_ready = True
+            if action == "register":
+                self.report["status"] = "registered"
+                return self.report
             if self.investigate:
                 self.investigate_points()
             else:
@@ -552,46 +672,75 @@ class ControllerV2:
             self.report.update(status="incomplete", reason=str(exc) or "Interrupted")
         finally:
             self.runtime.stop()
-            # Preserve all started work and partial Git operations. Nothing is reset or cleaned.
-            for tid, session in self.sessions.items():
-                state = self.report["tickets"][tid]
-                state.update(attempts=session.report["tickets"][tid]["attempts"], processes=session.report["processes"])
-            if hasattr(self, "final_session"):
-                self.report["final_processes"] = self.final_session.report["processes"]
-            for state in self.report["tickets"].values():
-                if state["status"] == "pending":
-                    state["status"] = "not_run"
-            try:
-                self.unchanged()
-                if self.report["status"] == "verified" and repository_inputs(self.integration) != self.report["final_inputs"]:
-                    raise FactoryError("Source changed during finalization; evidence stale")
-            except (FactoryError, OSError) as exc:
-                self.report.update(status="incomplete", reason=str(exc))
-            self.report["observed_worktree_inputs"] = {}
-            try:
-                for session in self.sessions.values():
-                    for path in session.repositories.values():
-                        self.report["observed_worktree_inputs"][str(path)] = snapshot(path)
-                for path in self.integration.values():
-                    self.report["observed_worktree_inputs"][str(path)] = snapshot(path)
-                self.report["evidence_files"] = [
-                    {"path": str(path), "sha256": digest(path.read_bytes())}
-                    for directory in ("tasks", "final", "investigations", "setup", "original-baselines")
-                    for path in sorted((self.output / directory).rglob("*")) if path.is_file()]
-            except (FactoryError, OSError) as exc:
-                self.report.update(status="incomplete", reason=str(exc))
-            self.report["finished_at_aest"] = now()
-            try:
-                self.save()
-            finally:
+            # A rejected concurrent opener must not overwrite the active run's report.
+            if self.acquired and self.operation_ready:
+                self.finalize()
+            else:
                 for stream in self.locks:
-                    fcntl.flock(stream, fcntl.LOCK_UN)
                     stream.close()
+                if not self.resuming and not (self.output / "report.json").exists():
+                    self.save()
         return self.report
+
+    def finalize(self):
+        # Preserve all started work and partial Git operations. Nothing is reset or cleaned.
+        for tid, session in self.sessions.items():
+            state = self.report["tickets"][tid]
+            state.update(attempts=session.report["tickets"][tid]["attempts"], processes=session.report["processes"])
+        if hasattr(self, "final_session"):
+            self.report["final_processes"] = self.final_session.report["processes"]
+        for state in self.report["tickets"].values():
+            if state["status"] == "pending":
+                state["status"] = "not_run"
+        try:
+            self.unchanged()
+            if self.report["status"] == "verified" and repository_inputs(self.integration) != self.report["final_inputs"]:
+                raise FactoryError("Source changed during finalization; evidence stale")
+        except (FactoryError, OSError) as exc:
+            self.report.update(status="incomplete", reason=str(exc))
+        try:
+            from factory_lifecycle import known_worktrees, retained_inputs
+            expected = retained_inputs(self, checkpoints=True)
+            actual = {path: snapshot(Path(path)) for path in known_worktrees(self.report)}
+            # Preserve the controller's checkpoints, including on failure. Saving
+            # current external edits here would silently authorize them on retry.
+            self.report["observed_worktree_inputs"] = expected
+            if actual != expected:
+                self.report.update(status="incomplete", reason="Unaccounted worktree edits; use adopt REPORT --reason TEXT to record retained edits and rerun checks and fresh review")
+            self.report["evidence_files"] = [
+                {"path": str(path), "sha256": digest(path.read_bytes())}
+                for directory in ("tasks", "final", "investigations", "setup", "original-baselines", "adoptions", "history")
+                for path in sorted((self.output / directory).rglob("*")) if path.is_file()]
+        except (FactoryError, OSError) as exc:
+            self.report.update(status="incomplete", reason=str(exc))
+        self.report["operation_open"] = False
+        self.report["finished_at_aest"] = now()
+        try:
+            self.save()
+            from factory_lifecycle import complete, finish_claim
+            if self.report["status"] == "verified":
+                try:
+                    complete(self.output / "report.json")
+                except (FactoryError, OSError, KeyError, TypeError, ValueError) as exc:
+                    self.report.update(status="incomplete", reason="Completion gate: " + str(exc))
+                    self.save()
+            finish_claim(self)
+        finally:
+            for stream in self.locks:
+                fcntl.flock(stream, fcntl.LOCK_UN)
+                stream.close()
 
 
 def report_status(path):
     report = read_json(path)
+    if report.get("mode") == "build" and report.get("status") == "verified":
+        from factory_lifecycle import complete
+        try:
+            return complete(path)
+        except (FactoryError, OSError, KeyError, TypeError, ValueError) as exc:
+            return {"status": "stale", "fresh": False, "report": str(Path(path).resolve()), "reason": str(exc)}
+    if report.get("status") == "closed":
+        return {"status": "closed", "verified": False, "report": str(Path(path).resolve()), "closure": report["closure"]}
     fresh = False
     try:
         fresh = (digest(Path(report["plan_path"]).read_bytes()) == report["plan_sha256"]

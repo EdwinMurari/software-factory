@@ -584,14 +584,58 @@ class Controller:
         self.save()
         return self.worker(phase, ticket, evidence), before
 
+    def recover_validation(self, entry, ids, phase):
+        """Bind durable process evidence to its interrupted attempt handoff."""
+        if entry.get("review") is not None:
+            return
+        processes = self.report["processes"]
+        start = entry.get("validation_process_index")
+        if start is None:
+            # Earlier reports can recover reviews after their last saved check.
+            checks = entry.get("checks", [])
+            if not checks:
+                return
+            start = next((i + 1 for i, record in enumerate(processes)
+                          if record["stdout"] == checks[-1]["stdout"]), len(processes))
+        recovered = []
+        labels = {"check-" + cid: cid for cid in dict.fromkeys(ids)}
+        for record in processes[start:]:
+            cid = labels.get(record["phase"])
+            if cid is not None:
+                check = dict(record, check_id=cid, reused=False)
+                if "repo" in self.checks[cid]:
+                    check["repo"] = self.checks[cid]["repo"]
+                recovered.append(check)
+            elif record["phase"] == phase:
+                if record["status"] == "passed" and "result" in record:
+                    entry["review"] = record["result"]
+                break
+        if recovered:
+            entry["checks"] = recovered
+        self.save()
+
     def run_ticket(self, ticket, resume=False):
         state = self.report["tickets"][ticket["id"]]
         if state.get("no_progress_stop"):
             raise FactoryError(f"Ticket {ticket['id']} made no source progress; stopped")
+        if resume and state["attempts"]:
+            self.recover_validation(state["attempts"][-1], ticket["checks"], "review-" + ticket["id"])
         evidence, seen = [], set(state.get("progress_inputs", []))
         retained = resume and bool(state["attempts"] or self.report["processes"])
         if retained:
             evidence = [{"continuation": "Continue retained work after interruption", "attempts": state["attempts"]}]
+            if state["attempts"]:
+                previous = state["attempts"][-1]
+                review, checks = previous.get("review"), previous.get("checks", [])
+                if review and not state.get("adopted_source"):
+                    if self.review_complete(review) and previous["inputs_sha256"] == self.inputs():
+                        state["status"] = "verified"
+                        self.save()
+                        return
+                    if review["status"] == "changes_requested":
+                        evidence = [{"review": review, "checks": self.failure_evidence(checks)}]
+                elif any(c["status"] == "failed" for c in checks):
+                    evidence = self.failure_evidence(checks)
         for attempt in self.attempts():
             before = self.progress()
             previous = state["attempts"][-1] if retained and state["attempts"] else None
@@ -614,7 +658,8 @@ class Controller:
                 result, before = self.source_worker("repair" if repairing else "implement", ticket, evidence)
             after = self.inputs()
             progress = self.progress()
-            entry = {"number": len(state["attempts"]) + 1, "worker": result, "inputs_sha256": after, "checks": [], "review": None}
+            entry = {"number": len(state["attempts"]) + 1, "worker": result, "inputs_sha256": after, "checks": [], "review": None,
+                     "validation_process_index": len(self.report["processes"])}
             state["attempts"].append(entry)
             self.report.pop("pending_source_worker", None)
             state.pop("adopted_source", None)
@@ -634,6 +679,7 @@ class Controller:
                 raise FactoryError(f"Ticket {ticket['id']} made no source progress; stopped")
             checks = self.run_checks(ticket["checks"])
             entry["checks"] = checks
+            self.save()
             if not all(c["status"] == "passed" for c in checks):
                 if any(c["status"] not in ("passed", "failed") for c in checks):
                     raise FactoryError("Check interrupted, unavailable or changed source; evidence incomplete")
@@ -663,6 +709,7 @@ class Controller:
         self.report.pop("integration_no_progress_stop", None)
         previous = self.report["integration_attempts"][-1] if self.report["integration_attempts"] else None
         if previous:
+            self.recover_validation(previous, required + self.plan["integration_checks"], "final_review")
             checks, review = previous.get("checks", []), previous.get("review")
             # Retained repairs or adopted edits need new validation. Only require
             # another source mutation when the failure describes today's inputs.
@@ -686,13 +733,15 @@ class Controller:
                     self.save()
                     raise FactoryError("Integration repair made no source progress; stopped")
             progress = self.progress()
-            checks = self.run_checks(required + self.plan["integration_checks"])
-            self.report["final_checks"] = checks
-            entry = {"number": len(self.report["integration_attempts"]) + 1, "checks": checks, "review": None}
+            entry = {"number": len(self.report["integration_attempts"]) + 1, "checks": [], "review": None,
+                     "validation_process_index": len(self.report["processes"])}
             self.report["integration_attempts"].append(entry)
             seen.add(progress)
             self.report["integration_progress_inputs"] = sorted(seen)
             self.report.pop("pending_source_worker", None)
+            self.save()
+            checks = self.run_checks(required + self.plan["integration_checks"])
+            entry["checks"] = self.report["final_checks"] = checks
             self.save()
             if any(c["status"] not in ("passed", "failed") for c in checks):
                 raise FactoryError("Final check interrupted, unavailable or changed source")

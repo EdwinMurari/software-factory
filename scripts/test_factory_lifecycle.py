@@ -305,6 +305,68 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual((task / 'a.txt').read_text(), 'persisted')
         self.assertEqual((task / 'fix.txt').read_text(), 'x')
 
+    def assert_validation_handoff_recovers(self, phase):
+        final = phase.startswith('final')
+        check = phase.endswith('check')
+        if check:
+            self.f.plan['checks'].append({'id': 'missing-fix', 'repo': 'app', 'argv':
+                [sys.executable, '-c', "import json; from pathlib import Path; "
+                 f"assert Path('fix.txt').exists() or json.loads(Path({str(self.f.control)!r}).read_text()).get('allow_check')"]})
+            if final:
+                self.f.plan['integration_checks'] = ['missing-fix']
+            else:
+                self.f.plan['tickets'][0]['checks'].append('missing-fix')
+            self.f.plan_path.write_text(json.dumps(self.f.plan))
+        else:
+            self.f.config(findings=True)
+        self.register()
+        owner = factory_v2.ControllerV2(self.f.plan_path, self.output, resume=True)
+        original = factory_v2.Session.execute if check else factory_v2.Session.worker
+        interrupted = []
+
+        def interrupt_return(session, *args, **kwargs):
+            result = original(session, *args, **kwargs)
+            label = args[1] if check else args[0]
+            expected = 'check-missing-fix' if check else phase
+            target = owner.output / ('final' if final else 'tasks/a')
+            if not interrupted and session.output == target and label == expected:
+                interrupted.append(True)
+                raise OSError('Interrupted validation result handoff')
+            return result
+
+        method = 'execute' if check else 'worker'
+        with patch.object(factory_v2.Session, method, new=interrupt_return):
+            result = owner.run()
+        self.assertTrue(interrupted)
+        self.assertIn('Interrupted validation result handoff', result['reason'])
+        calls = len(self.f.calls())
+        # A changed validation response cannot erase the saved failure.
+        self.f.config(allow_check=True)
+        code, value = self.cli('continue', self.report)
+        self.assertEqual(code, 0, value)
+        resumed = self.f.calls()[calls:]
+        self.assertEqual(resumed[0]['phase'], 'integration_repair' if final else 'repair')
+        evidence = json.dumps(resumed[0]['request']['evidence'])
+        self.assertIn('failed' if check else 'Missing fix.txt', evidence)
+        saved = json.loads(self.report.read_text())
+        self.assertTrue((Path(saved['repositories']['app']['worktree']) / 'fix.txt').exists())
+        self.assertEqual(self.cli('complete', self.report)[0], 0)
+
+    def test_task_review_result_survives_attempt_handoff(self):
+        self.assert_validation_handoff_recovers('review')
+
+    def test_final_review_result_survives_attempt_handoff(self):
+        # Task reviews approve; only the integration review reports the defect.
+        self.f.fake.write_text(self.f.fake.read_text().replace(
+            "control.get('findings') and 'review' in phase", "control.get('findings') and phase == 'final_review' and '/integration/' in str(next(iter(paths.values())))"))
+        self.assert_validation_handoff_recovers('final_review')
+
+    def test_task_failed_check_survives_attempt_handoff(self):
+        self.assert_validation_handoff_recovers('task_check')
+
+    def test_final_failed_check_survives_attempt_handoff(self):
+        self.assert_validation_handoff_recovers('final_check')
+
     def test_no_progress_task_cannot_advance_on_unchanged_continuation(self):
         self.f.config(findings=True, no_progress=True)
         self.register()

@@ -131,20 +131,16 @@ def load_plan(path, investigate=False):
 
 
 class Runtime:
-    """One deadline, cancellation flag and active process registry for the run."""
+    """One deadline and cancellation flag for the run."""
     def __init__(self, deadline):
         self.deadline = deadline
         self.cancelled = threading.Event()
         self.mutex = threading.Lock()
         self.git_mutex = threading.Lock()
-        self.active = set()
 
     def stop(self):
-        self.cancelled.set()
         with self.mutex:
-            processes = list(self.active)
-        for proc in processes:
-            kill_group(proc)
+            self.cancelled.set()
 
 
 class Session(Controller):
@@ -212,13 +208,12 @@ class Session(Controller):
         proc = None
         try:
             with out.open("wb") as stdout, err.open("wb") as stderr:
-                # Registration and cancellation share a mutex: cancellation cannot miss a new process.
+                # Do not start a process after cancellation. Its session owns cleanup.
                 with self.runtime.mutex:
                     if self.runtime.cancelled.is_set():
                         raise FactoryError("Run cancelled")
                     proc = subprocess.Popen(argv, cwd=cwd or self.project, stdin=subprocess.PIPE,
                                             stdout=stdout, stderr=stderr, start_new_session=True)
-                    self.runtime.active.add(proc)
                     record["pid"] = proc.pid
                     self.save()
                 end = time.monotonic() + available
@@ -233,16 +228,13 @@ class Session(Controller):
                         first = False
                         if self.runtime.cancelled.is_set() or time.monotonic() >= end:
                             record["status"] = "cancelled" if self.runtime.cancelled.is_set() else "timeout"
-                            kill_group(proc)
-                            record["exit_code"] = proc.returncode
                             break
         except OSError as exc:
             record["error"] = str(exc)
         finally:
             if proc is not None:
                 kill_group(proc)
-                with self.runtime.mutex:
-                    self.runtime.active.discard(proc)
+                record["exit_code"] = proc.returncode
             record["finished_at_aest"] = now()
             self.report["observed_inputs"] = repository_inputs(self.repositories)
             record["after_inputs_sha256"] = digest(encoded(self.report["observed_inputs"]))

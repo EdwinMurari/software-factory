@@ -7,14 +7,14 @@ import json
 import os
 from pathlib import Path
 import signal
-import subprocess
 import tempfile
 import threading
 import time
 import uuid
+from typing import ContextManager
 
-from factory import (Controller, FactoryError, capture_baseline, digest, encoded, git,
-                     identifier, keys, kill_group, now, positive, read_json, snapshot,
+from factory import (Controller, ExecutionInputs, FactoryError, capture_baseline, digest, encoded, git,
+                     identifier, keys, now, positive, read_json, snapshot,
                      strings, text, validate_v1, validate_result, repository_lock_path)
 from factory_audit import (INVESTIGATION_SCHEMA, audit_input, execution_intake,
                            investigation_result, reference, references_unchanged)
@@ -192,63 +192,26 @@ class Session(Controller):
     def plan_unchanged(self):
         self.owner.unchanged()
 
-    def execute(self, argv, label, timeout, stdin=b"", readonly=False, cwd=None):
-        self.plan_unchanged()
-        if self.runtime.cancelled.is_set():
-            raise FactoryError("Run cancelled")
-        before_inputs = repository_inputs(self.repositories)
-        before = digest(encoded(before_inputs))
-        if before_inputs != self.report["observed_inputs"]:
+    def execution_inputs(self) -> ExecutionInputs:
+        inputs = repository_inputs(self.repositories)
+        return ExecutionInputs(digest(encoded(inputs)), inputs)
+
+    def before_execution(self) -> ExecutionInputs:
+        inputs = self.execution_inputs()
+        if inputs.repositories != self.report["observed_inputs"]:
             raise FactoryError("Unaccounted worktree edits; use adopt REPORT --reason TEXT to record retained edits and rerun checks and fresh review")
-        available = min(timeout, self.deadline - time.monotonic())
-        if available <= 0:
-            raise FactoryError("Run wall-clock budget exhausted")
-        self.sequence += 1
-        stem = f"{self.sequence:03d}-{label}"
-        out, err = self.output / (stem + ".stdout"), self.output / (stem + ".stderr")
-        record = {"argv": argv, "phase": label, "stdout": str(out), "stderr": str(err),
-                  "inputs_sha256": before, "repository_inputs": before_inputs,
-                  "started_at_aest": now(), "status": "incomplete", "cwd": str(cwd or self.project)}
-        self.report["processes"].append(record)
-        self.save()
-        proc = None
-        try:
-            with out.open("wb") as stdout, err.open("wb") as stderr:
-                # Do not start a process after cancellation. Its session owns cleanup.
-                with self.runtime.mutex:
-                    if self.runtime.cancelled.is_set():
-                        raise FactoryError("Run cancelled")
-                    proc = subprocess.Popen(argv, cwd=cwd or self.project, stdin=subprocess.PIPE,
-                                            stdout=stdout, stderr=stderr, start_new_session=True)
-                    record["pid"] = proc.pid
-                    self.save()
-                end = time.monotonic() + available
-                first = True
-                while True:
-                    try:
-                        proc.communicate(input=stdin if first else None, timeout=min(0.2, max(0.001, end - time.monotonic())))
-                        record["exit_code"] = proc.returncode
-                        record["status"] = "passed" if proc.returncode == 0 else "failed"
-                        break
-                    except subprocess.TimeoutExpired:
-                        first = False
-                        if self.runtime.cancelled.is_set() or time.monotonic() >= end:
-                            record["status"] = "cancelled" if self.runtime.cancelled.is_set() else "timeout"
-                            break
-        except OSError as exc:
-            record["error"] = str(exc)
-        finally:
-            if proc is not None:
-                kill_group(proc)
-                record["exit_code"] = proc.returncode
-            record["finished_at_aest"] = now()
-            self.report["observed_inputs"] = repository_inputs(self.repositories)
-            record["after_inputs_sha256"] = digest(encoded(self.report["observed_inputs"]))
-            if readonly and before != record["after_inputs_sha256"]:
-                record["status"] = "source_changed"
-            self.save()
-        self.plan_unchanged()
-        return record
+        return inputs
+
+    def after_execution(self) -> ExecutionInputs:
+        inputs = self.execution_inputs()
+        self.report["observed_inputs"] = inputs.repositories
+        return inputs
+
+    def execution_cancelled(self) -> bool:
+        return self.runtime.cancelled.is_set()
+
+    def execution_guard(self) -> ContextManager[object]:
+        return self.runtime.mutex
 
     def run_checks(self, ids):
         results = []
@@ -272,15 +235,38 @@ class Session(Controller):
                 "scope": "Only participating worktrees. Program controls commits and merges. No push, deployment or issue closing."}
 
     def worker(self, phase, ticket, evidence):
-        heads = {name: git(path, "rev-parse", "HEAD", "--abbrev-ref", "HEAD") for name, path in self.repositories.items()}
+        heads = {name: os.fsdecode(git(path, "rev-parse", "HEAD", "--abbrev-ref", "HEAD"))
+                 for name, path in self.repositories.items()}
+        pending = self.report.get("pending_source_worker")
+        if pending and pending["label"] == phase + ("-" + ticket["id"] if ticket else ""):
+            pending["heads"] = heads
+            self.save()
+        else:
+            pending = None
         result = super().worker(phase, ticket, evidence)
-        if any(git(path, "rev-parse", "HEAD", "--abbrev-ref", "HEAD") != heads[name] for name, path in self.repositories.items()):
+        if any(os.fsdecode(git(path, "rev-parse", "HEAD", "--abbrev-ref", "HEAD")) != heads[name]
+               for name, path in self.repositories.items()):
             raise FactoryError("Worker changed Git HEAD; program controls commits and merges")
+        if pending and "heads" in pending:
+            pending["heads_validated"] = True
+            self.save()
         if "review" not in phase and result["status"] != "blocked":
             if phase == "merger" and any(git(path, "ls-files", "-u") for path in self.repositories.values()):
                 raise FactoryError("Conflict repair left unresolved Git entries; resolve and stage each conflict")
             self.commit_all(f"Factory {phase}: " + (ticket["id"] if ticket else "integration"))
         return result
+
+    def recover_source_worker(self, phase, ticket):
+        # A worker result can be saved before its controlled commit finishes.
+        # Continue that commit before measuring the completed source tree.
+        pending = self.report["pending_source_worker"]
+        if not pending.get("heads_validated"):
+            if any(os.fsdecode(git(path, "rev-parse", "HEAD", "--abbrev-ref", "HEAD")) != pending["heads"][name]
+                   for name, path in self.repositories.items()):
+                raise FactoryError("Worker changed Git HEAD; program controls commits and merges")
+            pending["heads_validated"] = True
+            self.save()
+        self.commit_all(f"Factory {phase}: " + (ticket["id"] if ticket else "integration"))
 
     def git_operation(self, path, *args, allow_failure=False):
         argv = ["git", "-c", "core.hooksPath=/dev/null", "-c", "user.name=Software Factory",
@@ -608,11 +594,7 @@ class ControllerV2:
         final = Session(self, self.integration, final_output, self.plan["tickets"], baseline).restore()
         self.final_session = final
         pending = [item for item in self.report.get("findings", []) if not item.get("resolved")]
-        if pending:
-            repair = final.worker("integration_repair", None, pending)
-            if repair["status"] == "blocked":
-                raise FactoryError("Late finding repair blocked: " + repair["summary"])
-        final.verify_integration()
+        final.verify_integration(pending)
         for item in pending:
             item["resolved"] = True
         self.unchanged()

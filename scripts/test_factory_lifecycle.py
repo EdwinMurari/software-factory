@@ -233,6 +233,87 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(updated['run_id'], value['run_id'])
         self.assertTrue(updated['findings'][0]['resolved'])
 
+    def stop_unchanged_late_repair(self):
+        value = self.build()
+        self.f.config(no_progress=True)
+        findings = self.f.base / 'late.json'
+        findings.write_text(json.dumps(['Missing fix.txt']))
+        calls = len(self.f.calls())
+        code, result = self.cli('reopen', self.report, '--findings', findings)
+        self.assertNotEqual(code, 0, result)
+        self.assertIn('Integration repair made no source progress', result['reason'])
+        updated = json.loads(self.report.read_text())
+        self.assertEqual(updated['final_inputs'], value['final_inputs'])
+        self.assertFalse(updated['findings'][0]['resolved'])
+        self.assertFalse((Path(value['repositories']['app']['worktree']) / 'fix.txt').exists())
+        self.assertEqual([c['phase'] for c in self.f.calls()[calls:]], ['integration_repair'])
+        return updated
+
+    def test_unchanged_late_repair_stops_before_validation_and_stays_stopped(self):
+        self.stop_unchanged_late_repair()
+        calls = self.f.calls()
+        processes = json.loads((self.output / 'final' / 'report.json').read_text())['processes']
+        for _ in range(2):
+            code, result = self.cli('continue', self.report)
+            self.assertNotEqual(code, 0, result)
+            self.assertIn('Integration repair made no source progress', result['reason'])
+            self.assertFalse(json.loads(self.report.read_text())['findings'][0]['resolved'])
+        self.assertEqual(self.f.calls(), calls)
+        self.assertEqual(json.loads((self.output / 'final' / 'report.json').read_text())['processes'], processes)
+        self.assertNotEqual(self.cli('complete', self.report)[0], 0)
+
+    def test_adopted_changed_source_recovers_unchanged_late_repair(self):
+        value = self.stop_unchanged_late_repair()
+        target = Path(value['repositories']['app']['worktree']) / 'fix.txt'
+        target.write_text('approved correction')
+        calls = len(self.f.calls())
+        code, result = self.cli('adopt', self.report, '--reason', 'Retain the approved late correction')
+        self.assertEqual(code, 0, result)
+        self.assertEqual(target.read_text(), 'approved correction')
+        self.assertEqual([c['phase'] for c in self.f.calls()[calls:]], ['final_review'])
+        updated = json.loads(self.report.read_text())
+        self.assertNotEqual(updated['final_inputs'], value['final_inputs'])
+        self.assertTrue(updated['findings'][0]['resolved'])
+        self.assertEqual(self.cli('complete', self.report)[0], 0)
+
+    def recover_interrupted_late_repair(self, after_worker):
+        value = self.build()
+        findings = self.f.base / 'late.json'
+        findings.write_text(json.dumps(['Missing fix.txt']))
+        owner = factory_v2.ControllerV2(self.f.plan_path, self.output, resume=True)
+        source_worker = factory_v2.Session.source_worker
+
+        def interrupt_worker(session, phase, ticket, evidence):
+            result = source_worker(session, phase, ticket, evidence)
+            if phase == 'integration_repair':
+                raise OSError('Interrupted late repair')
+            return result
+
+        hook = (patch.object(factory_v2.Session, 'source_worker', new=interrupt_worker) if after_worker
+                else patch.object(factory_v2.Session, 'run_checks', side_effect=OSError('Interrupted late repair')))
+        with hook:
+            result = owner.run('reopen', findings=findings)
+        self.assertEqual(result['status'], 'incomplete')
+        self.assertIn('Interrupted late repair', result['reason'])
+        self.assertFalse(result['findings'][0]['resolved'])
+        target = Path(value['repositories']['app']['worktree']) / 'fix.txt'
+        self.assertEqual(target.read_text(), 'x')
+        self.f.config(no_progress=True)
+        calls = len(self.f.calls())
+        code, result = self.cli('continue', self.report)
+        self.assertEqual(code, 0, result)
+        self.assertEqual(target.read_text(), 'x')
+        self.assertEqual([c['phase'] for c in self.f.calls()[calls:]], ['final_review'])
+        self.assertEqual(sum(c['phase'] == 'integration_repair' for c in self.f.calls()), 1)
+        self.assertTrue(json.loads(self.report.read_text())['findings'][0]['resolved'])
+        self.assertEqual(self.cli('complete', self.report)[0], 0)
+
+    def test_completed_late_repair_recovers_worker_checkpoint(self):
+        self.recover_interrupted_late_repair(after_worker=True)
+
+    def test_late_repair_interrupted_before_checks_revalidates_retained_fix(self):
+        self.recover_interrupted_late_repair(after_worker=False)
+
     def test_restart_preserves_failed_worker_edits_and_attempt_logs(self):
         self.f.config(crash='a')
         self.register()
@@ -261,6 +342,295 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(code, 0, value)
         self.assertEqual(sum(c['phase'] == 'implement' for c in self.f.calls()), 1)
         self.assertNotIn('repair', [c['phase'] for c in self.f.calls()])
+
+    def test_restart_repairs_invalid_worker_result_and_preserves_partial_work(self):
+        original = self.f.fake.read_text()
+        self.f.fake.write_text(original.replace(
+            "issues = []", "if phase == 'implement':\n    print('invalid result')\n    sys.exit()\nissues = []"))
+        self.register()
+        code, result = self.cli('continue', self.report)
+        self.assertNotEqual(code, 0)
+        self.assertIn('Cannot read JSON', result['reason'])
+        partial = json.loads(self.report.read_text())
+        task = Path(partial['tickets']['a']['repositories']['app']['worktree'])
+        self.assertEqual((task / 'a.txt').read_text(), 'persisted')
+        logs = {p: p.read_bytes() for p in (self.output / 'tasks').rglob('*.stdout')}
+        self.f.fake.write_text(original)
+        code, result = self.cli('continue', self.report)
+        self.assertEqual(code, 0, result)
+        self.assertEqual([c['phase'] for c in self.f.calls() if c['phase'] != 'final_review'],
+                         ['implement', 'repair', 'review'])
+        self.assertEqual((task / 'a.txt').read_text(), 'persisted')
+        self.assertEqual((task / 'fix.txt').read_text(), 'x')
+        for path, data in logs.items():
+            self.assertEqual(path.read_bytes(), data)
+
+    def test_restart_repairs_interrupted_worker_without_restarting_implementation(self):
+        original = self.f.fake.read_text()
+        self.f.fake.write_text(original.replace(
+            "issues = []", "if phase == 'implement': time.sleep(60)\nissues = []"))
+        self.f.plan['worker_timeout_seconds'] = 1
+        self.f.plan_path.write_text(json.dumps(self.f.plan))
+        self.register()
+        code, result = self.cli('continue', self.report)
+        self.assertNotEqual(code, 0)
+        self.assertIn('process timeout', result['reason'])
+        partial = json.loads(self.report.read_text())
+        task = Path(partial['tickets']['a']['repositories']['app']['worktree'])
+        self.assertEqual((task / 'a.txt').read_text(), 'persisted')
+        self.f.fake.write_text(original)
+        code, result = self.cli('continue', self.report)
+        self.assertEqual(code, 0, result)
+        self.assertEqual([c['phase'] for c in self.f.calls() if c['phase'] != 'final_review'],
+                         ['implement', 'repair', 'review'])
+        self.assertEqual((task / 'a.txt').read_text(), 'persisted')
+        self.assertEqual((task / 'fix.txt').read_text(), 'x')
+
+    def assert_validation_handoff_recovers(self, phase):
+        final = phase.startswith('final')
+        check = phase.endswith('check')
+        if check:
+            self.f.plan['checks'].append({'id': 'missing-fix', 'repo': 'app', 'argv':
+                [sys.executable, '-c', "import json; from pathlib import Path; "
+                 f"assert Path('fix.txt').exists() or json.loads(Path({str(self.f.control)!r}).read_text()).get('allow_check')"]})
+            if final:
+                self.f.plan['integration_checks'] = ['missing-fix']
+            else:
+                self.f.plan['tickets'][0]['checks'].append('missing-fix')
+            self.f.plan_path.write_text(json.dumps(self.f.plan))
+        else:
+            self.f.config(findings=True)
+        self.register()
+        owner = factory_v2.ControllerV2(self.f.plan_path, self.output, resume=True)
+        original = factory_v2.Session.execute if check else factory_v2.Session.worker
+        interrupted = []
+
+        def interrupt_return(session, *args, **kwargs):
+            result = original(session, *args, **kwargs)
+            label = args[1] if check else args[0]
+            expected = 'check-missing-fix' if check else phase
+            target = owner.output / ('final' if final else 'tasks/a')
+            if not interrupted and session.output == target and label == expected:
+                interrupted.append(True)
+                raise OSError('Interrupted validation result handoff')
+            return result
+
+        method = 'execute' if check else 'worker'
+        with patch.object(factory_v2.Session, method, new=interrupt_return):
+            result = owner.run()
+        self.assertTrue(interrupted)
+        self.assertIn('Interrupted validation result handoff', result['reason'])
+        calls = len(self.f.calls())
+        # A changed validation response cannot erase the saved failure.
+        self.f.config(allow_check=True)
+        code, value = self.cli('continue', self.report)
+        self.assertEqual(code, 0, value)
+        resumed = self.f.calls()[calls:]
+        self.assertEqual(resumed[0]['phase'], 'integration_repair' if final else 'repair')
+        evidence = json.dumps(resumed[0]['request']['evidence'])
+        self.assertIn('failed' if check else 'Missing fix.txt', evidence)
+        saved = json.loads(self.report.read_text())
+        self.assertTrue((Path(saved['repositories']['app']['worktree']) / 'fix.txt').exists())
+        self.assertEqual(self.cli('complete', self.report)[0], 0)
+
+    def test_task_review_result_survives_attempt_handoff(self):
+        self.assert_validation_handoff_recovers('review')
+
+    def test_final_review_result_survives_attempt_handoff(self):
+        # Task reviews approve; only the integration review reports the defect.
+        self.f.fake.write_text(self.f.fake.read_text().replace(
+            "control.get('findings') and 'review' in phase", "control.get('findings') and phase == 'final_review' and '/integration/' in str(next(iter(paths.values())))"))
+        self.assert_validation_handoff_recovers('final_review')
+
+    def test_task_failed_check_survives_attempt_handoff(self):
+        self.assert_validation_handoff_recovers('task_check')
+
+    def test_final_failed_check_survives_attempt_handoff(self):
+        self.assert_validation_handoff_recovers('final_check')
+
+    def test_no_progress_task_cannot_advance_on_unchanged_continuation(self):
+        self.f.config(findings=True, no_progress=True)
+        self.register()
+        code, result = self.cli('continue', self.report)
+        self.assertNotEqual(code, 0)
+        self.assertIn('no source progress', result['reason'])
+        calls = self.f.calls()
+        task_report = self.output / 'tasks' / 'a' / 'report.json'
+        processes = json.loads(task_report.read_text())['processes']
+        # A new reviewer answer cannot approve the unchanged failed source.
+        self.f.config()
+        for _ in range(2):
+            code, result = self.cli('continue', self.report)
+            self.assertNotEqual(code, 0)
+            self.assertIn('no source progress', result['reason'])
+            self.assertEqual(self.f.calls(), calls)
+            self.assertEqual(json.loads(task_report.read_text())['processes'], processes)
+
+    def test_adopted_task_fix_recovers_persisted_no_progress_stop(self):
+        self.f.config(findings=True, no_progress=True)
+        self.register()
+        self.assertNotEqual(self.cli('continue', self.report)[0], 0)
+        value = json.loads(self.report.read_text())
+        task = Path(value['tickets']['a']['repositories']['app']['worktree'])
+        (task / 'fix.txt').write_text('explicit adopted fix')
+        code, result = self.cli('adopt', self.report, '--reason', 'Retain the approved task fix')
+        self.assertEqual(code, 0, result)
+        self.assertEqual([c['phase'] for c in self.f.calls() if c['phase'] != 'final_review'],
+                         ['implement', 'review', 'repair', 'review'])
+        self.assertTrue(any(c['phase'] == 'final_review' for c in self.f.calls()))
+        session = json.loads((self.output / 'tasks' / 'a' / 'report.json').read_text())
+        self.assertTrue(all(c['status'] == 'passed' for c in session['tickets']['a']['attempts'][-1]['checks']))
+        self.assertEqual(session['tickets']['a']['attempts'][-1]['review']['status'], 'complete')
+        self.assertEqual(self.cli('complete', self.report)[0], 0)
+
+    def test_interrupted_task_repair_before_checks_resumes_valid_source(self):
+        self.f.config(findings=True)
+        self.register()
+        original = factory_v2.Session.run_checks
+        def interrupt_repair(session, ids):
+            if session.report['tickets']['a']['attempts'][-1]['number'] == 2:
+                raise OSError('Interrupted task repair before checks')
+            return original(session, ids)
+        owner = factory_v2.ControllerV2(self.f.plan_path, self.output, resume=True)
+        with patch.object(factory_v2.Session, 'run_checks', new=interrupt_repair):
+            result = owner.run()
+        self.assertIn('Interrupted task repair before checks', result['reason'])
+        self.f.config(findings=True, no_progress=True)
+        code, result = self.cli('continue', self.report)
+        self.assertEqual(code, 0, result)
+        self.assertEqual(sum(c['phase'] == 'repair' for c in self.f.calls()), 1)
+        self.assertEqual(self.cli('complete', self.report)[0], 0)
+
+    def test_completed_task_repair_survives_worker_return_checkpoint(self):
+        self.f.config(findings=True)
+        self.register()
+        original = factory_v2.Session.worker
+        def interrupt_return(session, phase, ticket, evidence):
+            result = original(session, phase, ticket, evidence)
+            if phase == 'repair':
+                raise OSError('Interrupted after completed repair worker')
+            return result
+        owner = factory_v2.ControllerV2(self.f.plan_path, self.output, resume=True)
+        with patch.object(factory_v2.Session, 'worker', new=interrupt_return):
+            result = owner.run()
+        self.assertIn('Interrupted after completed repair worker', result['reason'])
+        task_report = self.output / 'tasks' / 'a' / 'report.json'
+        checkpoint = json.loads(task_report.read_text())
+        self.assertEqual(len(checkpoint['tickets']['a']['attempts']), 1)
+        task = Path(result['tickets']['a']['repositories']['app']['worktree'])
+        self.assertEqual((task / 'fix.txt').read_text(), 'x')
+        self.assertFalse(factory.git(task, 'status', '--porcelain'))
+        self.f.config(findings=True, no_progress=True)
+        code, result = self.cli('continue', self.report)
+        self.assertEqual(code, 0, result)
+        self.assertEqual(sum(c['phase'] == 'repair' for c in self.f.calls()), 1)
+        saved = json.loads(task_report.read_text())['tickets']['a']
+        self.assertEqual(saved['attempts'][-1]['review']['status'], 'complete')
+        self.assertTrue(all(c['status'] == 'passed' for c in saved['attempts'][-1]['checks']))
+        self.assertEqual(self.cli('complete', self.report)[0], 0)
+
+    def test_completed_task_repair_resumes_interrupted_controlled_commit(self):
+        self.f.config(findings=True)
+        self.register()
+        original = factory_v2.Session.git_operation
+        def interrupt_commit(session, path, *args, **kwargs):
+            if args[0] == 'commit' and (path / 'fix.txt').exists():
+                raise OSError('Interrupted repair commit')
+            return original(session, path, *args, **kwargs)
+        owner = factory_v2.ControllerV2(self.f.plan_path, self.output, resume=True)
+        with patch.object(factory_v2.Session, 'git_operation', new=interrupt_commit):
+            result = owner.run()
+        self.assertIn('Interrupted repair commit', result['reason'])
+        task = Path(result['tickets']['a']['repositories']['app']['worktree'])
+        self.assertEqual((task / 'fix.txt').read_text(), 'x')
+        self.assertTrue(factory.git(task, 'status', '--porcelain'))
+        self.f.config(findings=True, no_progress=True)
+        code, result = self.cli('continue', self.report)
+        self.assertEqual(code, 0, result)
+        self.assertFalse(factory.git(task, 'status', '--porcelain'))
+        self.assertEqual(sum(c['phase'] == 'repair' for c in self.f.calls()), 1)
+        self.assertEqual(self.cli('complete', self.report)[0], 0)
+
+    def test_worker_return_recovery_keeps_worker_head_restriction(self):
+        self.f.fake.write_text(self.f.fake.read_text().replace(
+            "issues = []", "if phase == 'implement':\n    for path in paths.values():\n        subprocess.run(['git', '-C', str(path), 'add', '-A'], check=True)\n        subprocess.run(['git', '-C', str(path), 'commit', '-m', 'Illegal worker commit'], check=True, stdout=sys.stderr)\nissues = []"))
+        self.register()
+        code, result = self.cli('continue', self.report)
+        self.assertNotEqual(code, 0)
+        self.assertIn('Worker changed Git HEAD', result['reason'])
+        calls = self.f.calls()
+        code, result = self.cli('continue', self.report)
+        self.assertNotEqual(code, 0)
+        self.assertIn('Worker changed Git HEAD', result['reason'])
+        self.assertEqual(self.f.calls(), calls)
+
+    def test_worker_return_recovery_rejects_unchanged_repair(self):
+        self.f.config(findings=True, no_progress=True)
+        self.register()
+        original = factory_v2.Session.worker
+        def interrupt_return(session, phase, ticket, evidence):
+            result = original(session, phase, ticket, evidence)
+            if phase == 'repair':
+                raise OSError('Interrupted unchanged repair return')
+            return result
+        owner = factory_v2.ControllerV2(self.f.plan_path, self.output, resume=True)
+        with patch.object(factory_v2.Session, 'worker', new=interrupt_return):
+            result = owner.run()
+        self.assertIn('Interrupted unchanged repair return', result['reason'])
+        calls = self.f.calls()
+        self.f.config()
+        for _ in range(2):
+            code, result = self.cli('continue', self.report)
+            self.assertNotEqual(code, 0)
+            self.assertIn('no source progress', result['reason'])
+            self.assertEqual(self.f.calls(), calls)
+
+    def test_blocked_integration_worker_can_retry_after_restart(self):
+        self.f.plan['max_attempts'] = 1
+        self.f.plan['checks'].append({'id': 'final-only', 'repo': 'app', 'argv':
+            [sys.executable, '-c', "from pathlib import Path; assert Path('fix.txt').exists()"]})
+        self.f.plan['integration_checks'] = ['final-only']
+        self.f.plan_path.write_text(json.dumps(self.f.plan))
+        self.f.fake.write_text(self.f.fake.read_text().replace(
+            "if control.get('pending') and 'review' in phase: status = 'blocked'",
+            "if control.get('block_integration') and phase == 'integration_repair': status = 'blocked'\nif control.get('pending') and 'review' in phase: status = 'blocked'"))
+        self.register()
+        self.assertNotEqual(self.cli('continue', self.report)[0], 0)
+        self.f.config(block_integration=True)
+        code, result = self.cli('continue', self.report)
+        self.assertNotEqual(code, 0)
+        self.assertIn('Integration repair blocked', result['reason'])
+        self.f.config(no_progress=True)
+        code, result = self.cli('continue', self.report)
+        self.assertEqual(code, 0, result)
+        self.assertEqual(sum(c['phase'] == 'integration_repair' for c in self.f.calls()), 2)
+        self.assertEqual(self.cli('complete', self.report)[0], 0)
+
+    def test_integration_failed_content_cycle_stops_across_restarts(self):
+        self.f.plan['max_attempts'] = 1
+        self.f.plan['checks'].append({'id': 'final-only', 'repo': 'app', 'argv':
+            [sys.executable, '-c', "from pathlib import Path; print(Path('cycle.txt').read_text() if Path('cycle.txt').exists() else 'absent'); raise SystemExit(1)"]})
+        self.f.plan['integration_checks'] = ['final-only']
+        self.f.plan_path.write_text(json.dumps(self.f.plan))
+        self.f.fake.write_text(self.f.fake.read_text().replace(
+            "if phase in ('repair', 'integration_repair') and not control.get('no_progress'):",
+            "if phase == 'integration_repair':\n    for path in paths.values():\n        p = path / 'cycle.txt'\n        p.write_text('B' if p.exists() and p.read_text() == 'A' else 'A')\nif phase == 'repair' and not control.get('no_progress'):"))
+        self.register()
+        for _ in range(4):
+            code, result = self.cli('continue', self.report)
+            self.assertNotEqual(code, 0, result)
+        self.assertIn('no source progress', result['reason'])
+        final_path = self.output / 'final' / 'report.json'
+        saved = json.loads(final_path.read_text())
+        outputs = [Path(a['checks'][-1]['stdout']).read_text().strip() for a in saved['integration_attempts']]
+        self.assertEqual(outputs, ['absent', 'A', 'B'])
+        calls = self.f.calls()
+        self.f.config(no_progress=True)
+        code, result = self.cli('continue', self.report)
+        self.assertNotEqual(code, 0, result)
+        self.assertIn('no source progress', result['reason'])
+        self.assertEqual(self.f.calls(), calls)
+        self.assertEqual(json.loads(final_path.read_text())['integration_attempts'], saved['integration_attempts'])
 
     def test_bounded_failed_check_continues_with_repair(self):
         self.f.plan['max_attempts'] = 1

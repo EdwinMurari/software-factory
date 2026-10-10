@@ -22,6 +22,9 @@ import sys
 import tempfile
 import time
 from datetime import datetime, timedelta, timezone
+from contextlib import nullcontext
+from dataclasses import dataclass
+from typing import ContextManager
 
 
 class FactoryError(Exception):
@@ -317,6 +320,12 @@ def capture_baseline(project, output):
             "inputs_sha256": before, "tracked_patch": str(patch), "untracked": untracked}
 
 
+@dataclass(frozen=True)
+class ExecutionInputs:
+    sha256: str
+    repositories: dict[str, str] | None = None
+
+
 class Controller:
     def __init__(self, plan_path, output_dir=None):
         self.plan_path = Path(plan_path).resolve()
@@ -362,9 +371,26 @@ class Controller:
         if digest(self.plan_path.read_bytes()) != self.plan_hash:
             raise FactoryError("Plan changed during the run; evidence is invalid")
 
-    def execute(self, argv, label, timeout, stdin=b"", readonly=False):
+    def execution_inputs(self) -> ExecutionInputs:
+        return ExecutionInputs(self.inputs())
+
+    def before_execution(self) -> ExecutionInputs:
+        return self.execution_inputs()
+
+    def after_execution(self) -> ExecutionInputs:
+        return self.execution_inputs()
+
+    def execution_cancelled(self) -> bool:
+        return False
+
+    def execution_guard(self) -> ContextManager[object]:
+        return nullcontext()
+
+    def execute(self, argv, label, timeout, stdin=b"", readonly=False, cwd=None):
         self.plan_unchanged()
-        before = self.inputs()
+        if self.execution_cancelled():
+            raise FactoryError("Run cancelled")
+        before = self.before_execution()
         available = min(timeout, self.deadline - time.monotonic())
         if available <= 0:
             raise FactoryError("Run wall-clock budget exhausted")
@@ -372,30 +398,45 @@ class Controller:
         stem = f"{self.sequence:03d}-{label}"
         out, err = self.output / (stem + ".stdout"), self.output / (stem + ".stderr")
         record = {"argv": argv, "phase": label, "stdout": str(out), "stderr": str(err),
-                  "inputs_sha256": before, "started_at_aest": now(), "status": "incomplete"}
+                  "inputs_sha256": before.sha256, "started_at_aest": now(), "status": "incomplete"}
+        if before.repositories is not None:
+            record.update(repository_inputs=before.repositories, cwd=str(cwd or self.project))
         self.report["processes"].append(record)
         self.save()
         proc = None
         try:
             with out.open("wb") as stdout, err.open("wb") as stderr:
-                proc = subprocess.Popen(argv, cwd=self.project, stdin=subprocess.PIPE,
-                                        stdout=stdout, stderr=stderr, start_new_session=True)
-                try:
-                    proc.communicate(input=stdin, timeout=available)
-                    record["exit_code"] = proc.returncode
-                    record["status"] = "passed" if proc.returncode == 0 else "failed"
-                except subprocess.TimeoutExpired:
-                    record["status"] = "timeout"
-                    kill_group(proc)
-                    record["exit_code"] = proc.returncode
+                # The session that starts the process is its sole cleanup owner.
+                with self.execution_guard():
+                    if self.execution_cancelled():
+                        raise FactoryError("Run cancelled")
+                    proc = subprocess.Popen(argv, cwd=cwd or self.project, stdin=subprocess.PIPE,
+                                            stdout=stdout, stderr=stderr, start_new_session=True)
+                    if before.repositories is not None:
+                        record["pid"] = proc.pid
+                        self.save()
+                end = time.monotonic() + available
+                first = True
+                while True:
+                    try:
+                        proc.communicate(input=stdin if first else None,
+                                         timeout=min(0.2, max(0.001, end - time.monotonic())))
+                        record["status"] = "passed" if proc.returncode == 0 else "failed"
+                        break
+                    except subprocess.TimeoutExpired:
+                        first = False
+                        if self.execution_cancelled() or time.monotonic() >= end:
+                            record["status"] = "cancelled" if self.execution_cancelled() else "timeout"
+                            break
         except OSError as exc:
             record["error"] = str(exc)
         finally:
             if proc is not None:
                 kill_group(proc)
+                record["exit_code"] = proc.returncode
             record["finished_at_aest"] = now()
-            record["after_inputs_sha256"] = self.inputs()
-            if readonly and before != record["after_inputs_sha256"]:
+            record["after_inputs_sha256"] = self.after_execution().sha256
+            if readonly and before.sha256 != record["after_inputs_sha256"]:
                 record["status"] = "source_changed"
             self.save()
         self.plan_unchanged()
@@ -515,35 +556,130 @@ class Controller:
         limit = self.plan.get("max_attempts")
         return range(limit) if limit is not None else itertools.count()
 
+    def recover_source_worker(self, phase, ticket):
+        """Finish version-specific source bookkeeping after a persisted result."""
+
+    def pending_source_result(self, label):
+        pending = self.report.get("pending_source_worker")
+        if pending and pending["label"] == label:
+            for record in self.report["processes"][pending["process_index"]:]:
+                if (record["phase"] == label and record["status"] == "passed"
+                        and "result" in record and record["result"]["status"] != "blocked"):
+                    return record["result"]
+        return None
+
+    def source_worker(self, phase, ticket, evidence):
+        # The worker result is durable before the enclosing attempt is saved.
+        # Retain the pre-dispatch content so a recovered repair is measured
+        # against its actual starting source, not its completed source.
+        pending = self.report.get("pending_source_worker")
+        label = phase + ("-" + ticket["id"] if ticket else "")
+        result = self.pending_source_result(label)
+        if result is not None:
+            self.recover_source_worker(phase, ticket)
+            return result, pending["before"]
+        before = self.progress()
+        self.report["pending_source_worker"] = {
+            "label": label, "process_index": len(self.report["processes"]), "before": before}
+        self.save()
+        return self.worker(phase, ticket, evidence), before
+
+    def recover_validation(self, entry, ids, phase):
+        """Bind durable process evidence to its interrupted attempt handoff."""
+        if entry.get("review") is not None:
+            return
+        processes = self.report["processes"]
+        start = entry.get("validation_process_index")
+        if start is None:
+            # Earlier reports can recover reviews after their last saved check.
+            checks = entry.get("checks", [])
+            if not checks:
+                return
+            start = next((i + 1 for i, record in enumerate(processes)
+                          if record["stdout"] == checks[-1]["stdout"]), len(processes))
+        recovered = []
+        labels = {"check-" + cid: cid for cid in dict.fromkeys(ids)}
+        for record in processes[start:]:
+            cid = labels.get(record["phase"])
+            if cid is not None:
+                check = dict(record, check_id=cid, reused=False)
+                if "repo" in self.checks[cid]:
+                    check["repo"] = self.checks[cid]["repo"]
+                recovered.append(check)
+            elif record["phase"] == phase:
+                if record["status"] == "passed" and "result" in record:
+                    entry["review"] = record["result"]
+                break
+        if recovered:
+            entry["checks"] = recovered
+        self.save()
+
     def run_ticket(self, ticket, resume=False):
         state = self.report["tickets"][ticket["id"]]
-        evidence, seen = [], set()
+        if state.get("no_progress_stop"):
+            raise FactoryError(f"Ticket {ticket['id']} made no source progress; stopped")
+        if resume and state["attempts"]:
+            self.recover_validation(state["attempts"][-1], ticket["checks"], "review-" + ticket["id"])
+        evidence, seen = [], set(state.get("progress_inputs", []))
         retained = resume and bool(state["attempts"] or self.report["processes"])
         if retained:
             evidence = [{"continuation": "Continue retained work after interruption", "attempts": state["attempts"]}]
+            if state["attempts"]:
+                previous = state["attempts"][-1]
+                review, checks = previous.get("review"), previous.get("checks", [])
+                if review and not state.get("adopted_source"):
+                    if self.review_complete(review) and previous["inputs_sha256"] == self.inputs():
+                        state["status"] = "verified"
+                        self.save()
+                        return
+                    if review["status"] == "changes_requested":
+                        evidence = [{"review": review, "checks": self.failure_evidence(checks)}]
+                elif any(c["status"] == "failed" for c in checks):
+                    evidence = self.failure_evidence(checks)
         for attempt in self.attempts():
             before = self.progress()
             previous = state["attempts"][-1] if retained and state["attempts"] else None
-            if (attempt == 0 and previous and previous["worker"]["status"] == "complete"
-                    and not previous.get("review")
-                    and not any(c["status"] == "failed" for c in previous.get("checks", []))):
+            repairing = False
+            pending = self.report.get("pending_source_worker")
+            if (attempt == 0 and pending
+                    and pending["label"] in ("implement-" + ticket["id"], "repair-" + ticket["id"])
+                    and self.pending_source_result(pending["label"]) is not None):
+                repairing = pending["label"].startswith("repair-")
+                result, before = self.source_worker("repair" if repairing else "implement", ticket, evidence)
+            elif (attempt == 0 and previous and previous["worker"]["status"] == "complete"
+                    and (state.get("adopted_source") or
+                         (not previous.get("review")
+                          and not any(c["status"] == "failed" for c in previous.get("checks", []))))):
                 result = previous["worker"]
             elif attempt == 0 and retained and state.get("status") == "verified":
                 return
             else:
-                result = self.worker("implement" if attempt == 0 and not retained else "repair", ticket, evidence)
+                repairing = attempt != 0 or retained
+                result, before = self.source_worker("repair" if repairing else "implement", ticket, evidence)
             after = self.inputs()
             progress = self.progress()
-            entry = {"number": len(state["attempts"]) + 1, "worker": result, "inputs_sha256": after, "checks": [], "review": None}
+            entry = {"number": len(state["attempts"]) + 1, "worker": result, "inputs_sha256": after, "checks": [], "review": None,
+                     "validation_process_index": len(self.report["processes"])}
             state["attempts"].append(entry)
+            self.report.pop("pending_source_worker", None)
+            state.pop("adopted_source", None)
+            stopped = (result["status"] != "blocked" and repairing
+                       and (progress == before or progress in seen))
+            # Save the stop with its unchecked attempt. A restart must never
+            # mistake that attempt for an interrupted valid implementation.
+            if stopped:
+                state["no_progress_stop"] = {"inputs_sha256": after, "progress": progress}
+            elif result["status"] != "blocked":
+                seen.add(progress)
+                state["progress_inputs"] = sorted(seen)
             self.save()
             if result["status"] == "blocked":
                 raise FactoryError(f"Ticket {ticket['id']} blocked: {result['summary']}")
-            if attempt and (progress == before or progress in seen):
+            if stopped:
                 raise FactoryError(f"Ticket {ticket['id']} made no source progress; stopped")
-            seen.add(progress)
             checks = self.run_checks(ticket["checks"])
             entry["checks"] = checks
+            self.save()
             if not all(c["status"] == "passed" for c in checks):
                 if any(c["status"] not in ("passed", "failed") for c in checks):
                     raise FactoryError("Check interrupted, unavailable or changed source; evidence incomplete")
@@ -562,35 +698,60 @@ class Controller:
             self.save()
         raise FactoryError(f"Ticket {ticket['id']} exhausted its bounded attempts")
 
-    def verify_integration(self):
+    def verify_integration(self, findings=None):
         required = [c for tid in self.order for c in self.tickets[tid]["checks"]]
         self.report.setdefault("integration_attempts", [])
-        seen, evidence = set(), []
+        seen = set(self.report.get("integration_progress_inputs", []))
+        evidence = []
+        stopped = self.report.get("integration_no_progress_stop")
+        if stopped and stopped["progress"] == self.progress():
+            raise FactoryError("Integration repair made no source progress; stopped")
+        self.report.pop("integration_no_progress_stop", None)
+        if findings:
+            checkpoint = self.report.get("integration_findings")
+            if not checkpoint or checkpoint["evidence"] != findings:
+                checkpoint = {"evidence": findings, "progress": self.progress()}
+                self.report["integration_findings"] = checkpoint
+                self.save()
+            # A completed repair or adopted source can proceed to validation
+            # after interruption. Unchanged findings still require a repair.
+            if checkpoint["progress"] == self.progress():
+                evidence = findings
         previous = self.report["integration_attempts"][-1] if self.report["integration_attempts"] else None
         if previous:
+            self.recover_validation(previous, required + self.plan["integration_checks"], "final_review")
             checks, review = previous.get("checks", []), previous.get("review")
             # Retained repairs or adopted edits need new validation. Only require
             # another source mutation when the failure describes today's inputs.
             current = self.inputs()
             same_inputs = checks and all(c.get("inputs_sha256") == current for c in checks)
             if same_inputs and review and review["status"] == "changes_requested":
-                evidence = [{"review": review, "checks": self.failure_evidence(checks)}]
+                evidence += [{"review": review, "checks": self.failure_evidence(checks)}]
             elif same_inputs and any(c["status"] == "failed" for c in checks):
-                evidence = self.failure_evidence(checks)
+                evidence += self.failure_evidence(checks)
         for attempt in self.attempts():
             before = self.progress()
-            if attempt or evidence:
-                repair = self.worker("integration_repair", None, evidence)
+            pending = self.report.get("pending_source_worker")
+            if attempt or evidence or (pending and pending["label"] == "integration_repair"):
+                repair, before = self.source_worker("integration_repair", None, evidence)
                 if repair["status"] == "blocked":
                     raise FactoryError("Integration repair blocked: " + repair["summary"])
                 after = self.progress()
                 if after == before or after in seen:
+                    self.report["integration_no_progress_stop"] = {"progress": after}
+                    self.report.pop("pending_source_worker", None)
+                    self.save()
                     raise FactoryError("Integration repair made no source progress; stopped")
-            seen.add(self.progress())
-            checks = self.run_checks(required + self.plan["integration_checks"])
-            self.report["final_checks"] = checks
-            entry = {"number": len(self.report["integration_attempts"]) + 1, "checks": checks, "review": None}
+            progress = self.progress()
+            entry = {"number": len(self.report["integration_attempts"]) + 1, "checks": [], "review": None,
+                     "validation_process_index": len(self.report["processes"])}
             self.report["integration_attempts"].append(entry)
+            seen.add(progress)
+            self.report["integration_progress_inputs"] = sorted(seen)
+            self.report.pop("pending_source_worker", None)
+            self.save()
+            checks = self.run_checks(required + self.plan["integration_checks"])
+            entry["checks"] = self.report["final_checks"] = checks
             self.save()
             if any(c["status"] not in ("passed", "failed") for c in checks):
                 raise FactoryError("Final check interrupted, unavailable or changed source")

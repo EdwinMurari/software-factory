@@ -446,7 +446,7 @@ class IsolatedTests(unittest.TestCase):
             owner.runtime.stop()
 
         canceller = threading.Thread(target=cancel_started_worker)
-        with patch.object(factory_v2, 'kill_group', wraps=factory_v2.kill_group) as cleanup:
+        with patch.object(factory, 'kill_group', wraps=factory.kill_group) as cleanup:
             canceller.start()
             try:
                 result = owner.run()

@@ -408,14 +408,22 @@ class FactoryTests(unittest.TestCase):
             while not (self.base / "worker.pid").exists() and time.monotonic() < deadline:
                 time.sleep(0.02)
             self.assertTrue((self.base / "worker.pid").exists())
+            lock = factory.repository_lock_path(self.repo)
+            acquire = [sys.executable, '-c',
+                       "import fcntl, sys; "
+                       "lock = open(sys.argv[1], 'a+b'); "
+                       "fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)", str(lock)]
+            held = subprocess.run(acquire, capture_output=True, text=True, timeout=5)
+            self.assertNotEqual(held.returncode, 0, 'Running controller must hold the real lock')
             proc.send_signal(signal.SIGTERM)
             proc.communicate(timeout=5)
             report = json.loads((output / "report.json").read_text())
             self.assertEqual(report["status"], "incomplete")
             self.assertIn("SIGTERM", report["reason"])
             self.assert_process_stopped(int((self.base / "worker.pid").read_text()))
-            lock = Path(tempfile.gettempdir()) / f"software-factory-{os.getuid()}-{factory.digest(os.fsencode(self.repo.resolve()))[:24]}.lock"
-            self.assertFalse(lock.exists())
+            self.assertTrue(lock.exists())
+            acquired = subprocess.run(acquire, capture_output=True, text=True, timeout=5)
+            self.assertEqual(acquired.returncode, 0, acquired.stderr)
         finally:
             if proc.poll() is None:
                 proc.kill()

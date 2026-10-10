@@ -143,7 +143,10 @@ def finish_adoption(owner, adoption):
             session_path = owner.output / 'tasks' / tid / 'report.json'
             if session_path.exists():
                 session = read_json(session_path)
-                session['tickets'][tid]['status'] = 'incomplete'
+                task = session['tickets'][tid]
+                task['status'] = 'incomplete'
+                task.pop('no_progress_stop', None)
+                task['adopted_source'] = True
                 session['adopted_pending_commit'] = True
                 session['observed_inputs'] = {name: snapshot(Path(r['worktree'])) for name, r in records.items()}
                 atomic(session_path, session)

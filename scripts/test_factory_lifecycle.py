@@ -262,6 +262,59 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(sum(c['phase'] == 'implement' for c in self.f.calls()), 1)
         self.assertNotIn('repair', [c['phase'] for c in self.f.calls()])
 
+    def test_no_progress_task_cannot_advance_on_unchanged_continuation(self):
+        self.f.config(findings=True, no_progress=True)
+        self.register()
+        code, result = self.cli('continue', self.report)
+        self.assertNotEqual(code, 0)
+        self.assertIn('no source progress', result['reason'])
+        calls = self.f.calls()
+        task_report = self.output / 'tasks' / 'a' / 'report.json'
+        processes = json.loads(task_report.read_text())['processes']
+        # A new reviewer answer cannot approve the unchanged failed source.
+        self.f.config()
+        for _ in range(2):
+            code, result = self.cli('continue', self.report)
+            self.assertNotEqual(code, 0)
+            self.assertIn('no source progress', result['reason'])
+            self.assertEqual(self.f.calls(), calls)
+            self.assertEqual(json.loads(task_report.read_text())['processes'], processes)
+
+    def test_adopted_task_fix_recovers_persisted_no_progress_stop(self):
+        self.f.config(findings=True, no_progress=True)
+        self.register()
+        self.assertNotEqual(self.cli('continue', self.report)[0], 0)
+        value = json.loads(self.report.read_text())
+        task = Path(value['tickets']['a']['repositories']['app']['worktree'])
+        (task / 'fix.txt').write_text('explicit adopted fix')
+        code, result = self.cli('adopt', self.report, '--reason', 'Retain the approved task fix')
+        self.assertEqual(code, 0, result)
+        self.assertEqual([c['phase'] for c in self.f.calls() if c['phase'] != 'final_review'],
+                         ['implement', 'review', 'repair', 'review'])
+        self.assertTrue(any(c['phase'] == 'final_review' for c in self.f.calls()))
+        session = json.loads((self.output / 'tasks' / 'a' / 'report.json').read_text())
+        self.assertTrue(all(c['status'] == 'passed' for c in session['tickets']['a']['attempts'][-1]['checks']))
+        self.assertEqual(session['tickets']['a']['attempts'][-1]['review']['status'], 'complete')
+        self.assertEqual(self.cli('complete', self.report)[0], 0)
+
+    def test_interrupted_task_repair_before_checks_resumes_valid_source(self):
+        self.f.config(findings=True)
+        self.register()
+        original = factory_v2.Session.run_checks
+        def interrupt_repair(session, ids):
+            if session.report['tickets']['a']['attempts'][-1]['number'] == 2:
+                raise OSError('Interrupted task repair before checks')
+            return original(session, ids)
+        owner = factory_v2.ControllerV2(self.f.plan_path, self.output, resume=True)
+        with patch.object(factory_v2.Session, 'run_checks', new=interrupt_repair):
+            result = owner.run()
+        self.assertIn('Interrupted task repair before checks', result['reason'])
+        self.f.config(findings=True, no_progress=True)
+        code, result = self.cli('continue', self.report)
+        self.assertEqual(code, 0, result)
+        self.assertEqual(sum(c['phase'] == 'repair' for c in self.f.calls()), 1)
+        self.assertEqual(self.cli('complete', self.report)[0], 0)
+
     def test_bounded_failed_check_continues_with_repair(self):
         self.f.plan['max_attempts'] = 1
         self.f.plan['checks'][0]['argv'] = [sys.executable, '-c',

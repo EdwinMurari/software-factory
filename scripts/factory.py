@@ -22,6 +22,9 @@ import sys
 import tempfile
 import time
 from datetime import datetime, timedelta, timezone
+from contextlib import nullcontext
+from dataclasses import dataclass
+from typing import ContextManager
 
 
 class FactoryError(Exception):
@@ -317,6 +320,12 @@ def capture_baseline(project, output):
             "inputs_sha256": before, "tracked_patch": str(patch), "untracked": untracked}
 
 
+@dataclass(frozen=True)
+class ExecutionInputs:
+    sha256: str
+    repositories: dict[str, str] | None = None
+
+
 class Controller:
     def __init__(self, plan_path, output_dir=None):
         self.plan_path = Path(plan_path).resolve()
@@ -362,9 +371,26 @@ class Controller:
         if digest(self.plan_path.read_bytes()) != self.plan_hash:
             raise FactoryError("Plan changed during the run; evidence is invalid")
 
-    def execute(self, argv, label, timeout, stdin=b"", readonly=False):
+    def execution_inputs(self) -> ExecutionInputs:
+        return ExecutionInputs(self.inputs())
+
+    def before_execution(self) -> ExecutionInputs:
+        return self.execution_inputs()
+
+    def after_execution(self) -> ExecutionInputs:
+        return self.execution_inputs()
+
+    def execution_cancelled(self) -> bool:
+        return False
+
+    def execution_guard(self) -> ContextManager[object]:
+        return nullcontext()
+
+    def execute(self, argv, label, timeout, stdin=b"", readonly=False, cwd=None):
         self.plan_unchanged()
-        before = self.inputs()
+        if self.execution_cancelled():
+            raise FactoryError("Run cancelled")
+        before = self.before_execution()
         available = min(timeout, self.deadline - time.monotonic())
         if available <= 0:
             raise FactoryError("Run wall-clock budget exhausted")
@@ -372,30 +398,45 @@ class Controller:
         stem = f"{self.sequence:03d}-{label}"
         out, err = self.output / (stem + ".stdout"), self.output / (stem + ".stderr")
         record = {"argv": argv, "phase": label, "stdout": str(out), "stderr": str(err),
-                  "inputs_sha256": before, "started_at_aest": now(), "status": "incomplete"}
+                  "inputs_sha256": before.sha256, "started_at_aest": now(), "status": "incomplete"}
+        if before.repositories is not None:
+            record.update(repository_inputs=before.repositories, cwd=str(cwd or self.project))
         self.report["processes"].append(record)
         self.save()
         proc = None
         try:
             with out.open("wb") as stdout, err.open("wb") as stderr:
-                proc = subprocess.Popen(argv, cwd=self.project, stdin=subprocess.PIPE,
-                                        stdout=stdout, stderr=stderr, start_new_session=True)
-                try:
-                    proc.communicate(input=stdin, timeout=available)
-                    record["exit_code"] = proc.returncode
-                    record["status"] = "passed" if proc.returncode == 0 else "failed"
-                except subprocess.TimeoutExpired:
-                    record["status"] = "timeout"
-                    kill_group(proc)
-                    record["exit_code"] = proc.returncode
+                # The session that starts the process is its sole cleanup owner.
+                with self.execution_guard():
+                    if self.execution_cancelled():
+                        raise FactoryError("Run cancelled")
+                    proc = subprocess.Popen(argv, cwd=cwd or self.project, stdin=subprocess.PIPE,
+                                            stdout=stdout, stderr=stderr, start_new_session=True)
+                    if before.repositories is not None:
+                        record["pid"] = proc.pid
+                        self.save()
+                end = time.monotonic() + available
+                first = True
+                while True:
+                    try:
+                        proc.communicate(input=stdin if first else None,
+                                         timeout=min(0.2, max(0.001, end - time.monotonic())))
+                        record["status"] = "passed" if proc.returncode == 0 else "failed"
+                        break
+                    except subprocess.TimeoutExpired:
+                        first = False
+                        if self.execution_cancelled() or time.monotonic() >= end:
+                            record["status"] = "cancelled" if self.execution_cancelled() else "timeout"
+                            break
         except OSError as exc:
             record["error"] = str(exc)
         finally:
             if proc is not None:
                 kill_group(proc)
+                record["exit_code"] = proc.returncode
             record["finished_at_aest"] = now()
-            record["after_inputs_sha256"] = self.inputs()
-            if readonly and before != record["after_inputs_sha256"]:
+            record["after_inputs_sha256"] = self.after_execution().sha256
+            if readonly and before.sha256 != record["after_inputs_sha256"]:
                 record["status"] = "source_changed"
             self.save()
         self.plan_unchanged()
@@ -517,31 +558,45 @@ class Controller:
 
     def run_ticket(self, ticket, resume=False):
         state = self.report["tickets"][ticket["id"]]
-        evidence, seen = [], set()
+        if state.get("no_progress_stop"):
+            raise FactoryError(f"Ticket {ticket['id']} made no source progress; stopped")
+        evidence, seen = [], set(state.get("progress_inputs", []))
         retained = resume and bool(state["attempts"] or self.report["processes"])
         if retained:
             evidence = [{"continuation": "Continue retained work after interruption", "attempts": state["attempts"]}]
         for attempt in self.attempts():
             before = self.progress()
             previous = state["attempts"][-1] if retained and state["attempts"] else None
+            repairing = False
             if (attempt == 0 and previous and previous["worker"]["status"] == "complete"
-                    and not previous.get("review")
-                    and not any(c["status"] == "failed" for c in previous.get("checks", []))):
+                    and (state.get("adopted_source") or
+                         (not previous.get("review")
+                          and not any(c["status"] == "failed" for c in previous.get("checks", []))))):
                 result = previous["worker"]
             elif attempt == 0 and retained and state.get("status") == "verified":
                 return
             else:
-                result = self.worker("implement" if attempt == 0 and not retained else "repair", ticket, evidence)
+                repairing = attempt != 0 or retained
+                result = self.worker("repair" if repairing else "implement", ticket, evidence)
             after = self.inputs()
             progress = self.progress()
             entry = {"number": len(state["attempts"]) + 1, "worker": result, "inputs_sha256": after, "checks": [], "review": None}
             state["attempts"].append(entry)
+            state.pop("adopted_source", None)
+            stopped = (result["status"] != "blocked" and repairing
+                       and (progress == before or progress in seen))
+            # Save the stop with its unchecked attempt. A restart must never
+            # mistake that attempt for an interrupted valid implementation.
+            if stopped:
+                state["no_progress_stop"] = {"inputs_sha256": after, "progress": progress}
+            elif result["status"] != "blocked":
+                seen.add(progress)
+                state["progress_inputs"] = sorted(seen)
             self.save()
             if result["status"] == "blocked":
                 raise FactoryError(f"Ticket {ticket['id']} blocked: {result['summary']}")
-            if attempt and (progress == before or progress in seen):
+            if stopped:
                 raise FactoryError(f"Ticket {ticket['id']} made no source progress; stopped")
-            seen.add(progress)
             checks = self.run_checks(ticket["checks"])
             entry["checks"] = checks
             if not all(c["status"] == "passed" for c in checks):

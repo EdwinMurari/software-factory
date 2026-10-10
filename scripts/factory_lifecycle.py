@@ -74,8 +74,9 @@ def retained_inputs(owner, checkpoints=False):
         if ((checkpoints or owner.report.get('operation_open')) and record.get('head')
                 and git(root, 'rev-parse', 'HEAD').decode().strip() == record['head']
                 and not git(root, 'status', '--porcelain', '--untracked-files=all')):
-            observed.setdefault(str(root), snapshot(root))
-        observed.setdefault(record['worktree'], final.get('observed_inputs', {}).get(name, owner.source_inputs[name]))
+            observed.setdefault(str(root), record.get('inputs', owner.source_inputs[name]))
+        observed.setdefault(record['worktree'], final.get('observed_inputs', {}).get(
+            name, record.get('inputs', owner.source_inputs[name])))
     for index, adoption in enumerate(owner.report.get('adoptions', []), 1):
         if adoption.get('status') == 'pending':
             for path, change in adoption['changes'].items():
@@ -143,13 +144,15 @@ def finish_adoption(owner, adoption):
             if session_path.exists():
                 session = read_json(session_path)
                 session['tickets'][tid]['status'] = 'incomplete'
+                session['adopted_pending_commit'] = True
                 session['observed_inputs'] = {name: snapshot(Path(r['worktree'])) for name, r in records.items()}
                 atomic(session_path, session)
     if any(p in adoption['changes'] for p in map(str, owner.integration.values())):
         session = Session(owner, owner.integration, directory / 'commit', [], {}).restore()
         session.commit_all('Factory adopt: ' + adoption['reason'])
         for name, root in owner.integration.items():
-            owner.report['repositories'][name]['head'] = git(root, 'rev-parse', 'HEAD').decode().strip()
+            owner.report['repositories'][name].update(
+                head=git(root, 'rev-parse', 'HEAD').decode().strip(), inputs=session.report['observed_inputs'][name])
     adoption['status'] = 'complete'
     owner.save()
 

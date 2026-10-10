@@ -159,18 +159,23 @@ class Session(Controller):
         self.order = list(self.tickets)
         self.sequence, self.cache = 0, {}
         self.report = {"tickets": {tid: {"status": "pending", "attempts": []} for tid in self.order},
-                       "processes": [], "baseline": baseline, "final_checks": [], "final_review": None}
+                       "processes": [], "baseline": baseline, "final_checks": [], "final_review": None,
+                       "observed_inputs": self.expected_inputs()}
 
-    def save(self):
-        if "observed_inputs" not in self.report:
-            self.report["observed_inputs"] = repository_inputs(self.repositories)
-        super().save()
+    def expected_inputs(self):
+        from factory_lifecycle import retained_inputs
+        expected = retained_inputs(self.owner, checkpoints=True)
+        return {name: (self.owner.source_inputs[name] if path == self.owner.sources.get(name)
+                       else expected[str(path)]) for name, path in self.repositories.items()}
 
     def restore(self):
         path = self.output / "report.json"
         if path.exists():
             self.report = read_json(path)
             self.sequence = len(self.report["processes"])
+        # A controlled merge or recorded adoption can supersede an older final
+        # session. Resolve that checkpoint from controller evidence, never live edits.
+        self.report["observed_inputs"] = self.expected_inputs()
         return self
 
     def adapter_directories(self):
@@ -193,7 +198,8 @@ class Session(Controller):
             raise FactoryError("Run cancelled")
         before_inputs = repository_inputs(self.repositories)
         before = digest(encoded(before_inputs))
-        self.report["observed_inputs"] = before_inputs
+        if before_inputs != self.report["observed_inputs"]:
+            raise FactoryError("Unaccounted worktree edits; use adopt REPORT --reason TEXT to record retained edits and rerun checks and fresh review")
         available = min(timeout, self.deadline - time.monotonic())
         if available <= 0:
             raise FactoryError("Run wall-clock budget exhausted")
@@ -281,6 +287,11 @@ class Session(Controller):
                 "-c", "user.email=software-factory@localhost", "-c", "commit.gpgSign=false",
                 "-c", "merge.gpgSign=false", "-c", "rerere.enabled=false", "-C", str(path), *args]
         with self.runtime.git_mutex:
+            if path not in self.repositories.values():
+                from factory_lifecycle import retained_inputs
+                expected = retained_inputs(self.owner, checkpoints=True)
+                if snapshot(path) != expected.get(str(path)):
+                    raise FactoryError("Unaccounted worktree edits; use adopt REPORT --reason TEXT to record retained edits and rerun checks and fresh review")
             record = self.execute(argv, "git-" + args[0], 30)
         if record["status"] != "passed" and not (allow_failure and record["status"] == "failed"):
             raise FactoryError(f"Git {args[0]} {record['status']}; inspect preserved logs")
@@ -495,6 +506,10 @@ class ControllerV2:
 
     def run_task(self, ticket, session):
         try:
+            if session.report.get("adopted_pending_commit"):
+                session.commit_all("Factory adopt: " + ticket["id"])
+                session.report.pop("adopted_pending_commit")
+                session.save()
             session.run_ticket(ticket, resume=self.resuming)
             return None
         except (FactoryError, OSError) as exc:
@@ -527,7 +542,7 @@ class ControllerV2:
         for name, path in session.repositories.items():
             commit = os.fsdecode(git(path, "rev-parse", "HEAD")).strip()
             session.git_operation(self.integration[name], "merge", "--ff-only", commit)
-            self.report["repositories"][name]["head"] = commit
+            self.report["repositories"][name].update(head=commit, inputs=session.report["observed_inputs"][name])
         self.report["tickets"][tid]["status"] = "integrated"
         self.report["integration_order"].append(tid)
         self.save()
@@ -608,7 +623,8 @@ class ControllerV2:
         self.report.update(final_inputs=exact, final_checks=final.report["final_checks"], final_review=final.report["final_review"],
                            integration_attempts=final.report["integration_attempts"], final_processes=final.report["processes"], status="verified")
         for name, path in self.integration.items():
-            self.report["repositories"][name]["head"] = os.fsdecode(git(path, "rev-parse", "HEAD")).strip()
+            self.report["repositories"][name].update(
+                head=os.fsdecode(git(path, "rev-parse", "HEAD")).strip(), inputs=exact[name])
 
     def investigate_points(self):
         audit = self.plan["_audit"]

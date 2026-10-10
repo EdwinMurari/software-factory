@@ -81,6 +81,80 @@ class LifecycleTests(unittest.TestCase):
         # A source file named report.json is content, not a process checkpoint.
         self.assertEqual(self.cli('continue', self.report)[0], 0)
 
+    def test_external_edit_before_first_final_process_requires_adoption(self):
+        self.register()
+        owner = factory_v2.ControllerV2(self.f.plan_path, self.output, resume=True)
+        baseline = owner.baseline
+
+        def edit_before_final(repositories, directory, *args):
+            if directory == owner.output / 'original-baselines':
+                (owner.integration['app'] / 'unaccounted.txt').write_text('keep this edit')
+            return baseline(repositories, directory, *args)
+
+        with patch.object(owner, 'baseline', side_effect=edit_before_final):
+            result = owner.run()
+        self.assertEqual(result['status'], 'incomplete')
+        self.assertIn('adopt', result['reason'])
+        self.assertFalse(result.get('adoptions'))
+        target = owner.integration['app'] / 'unaccounted.txt'
+        self.assertEqual(target.read_text(), 'keep this edit')
+        self.assertNotEqual(self.cli('complete', self.report)[0], 0)
+        self.assertNotEqual(self.cli('continue', self.report)[0], 0)
+        reviews = sum(c['phase'] == 'final_review' for c in self.f.calls())
+        code, value = self.cli('adopt', self.report, '--reason', 'Retain approved integration edit')
+        self.assertEqual(code, 0, value)
+        self.assertEqual(target.read_text(), 'keep this edit')
+        self.assertTrue(json.loads(self.report.read_text())['adoptions'])
+        self.assertGreater(sum(c['phase'] == 'final_review' for c in self.f.calls()), reviews)
+        self.assertEqual(self.cli('complete', self.report)[0], 0)
+
+    def test_external_task_edit_between_check_and_review_requires_adoption(self):
+        self.register()
+        owner = factory_v2.ControllerV2(self.f.plan_path, self.output, resume=True)
+        run_checks = factory_v2.Session.run_checks
+        targets = []
+
+        def edit_after_checks(session, ids):
+            result = run_checks(session, ids)
+            if not targets and session.output == owner.output / 'tasks' / 'a':
+                targets.append(session.project / 'unaccounted.txt')
+                targets[0].write_text('keep task edit')
+            return result
+
+        with patch.object(factory_v2.Session, 'run_checks', new=edit_after_checks):
+            result = owner.run()
+        self.assertEqual(result['status'], 'incomplete')
+        self.assertIn('adopt', result['reason'])
+        self.assertEqual(targets[0].read_text(), 'keep task edit')
+        self.assertFalse(any(c['phase'] == 'review' for c in self.f.calls()))
+        self.assertNotEqual(self.cli('continue', self.report)[0], 0)
+        code, value = self.cli('adopt', self.report, '--reason', 'Retain approved task edit')
+        self.assertEqual(code, 0, value)
+        saved = json.loads(self.report.read_text())
+        self.assertEqual((Path(saved['repositories']['app']['worktree']) / 'unaccounted.txt').read_text(), 'keep task edit')
+        self.assertEqual(self.cli('complete', self.report)[0], 0)
+
+    def test_external_integration_edit_before_task_merge_requires_adoption(self):
+        self.register()
+        owner = factory_v2.ControllerV2(self.f.plan_path, self.output, resume=True)
+        integrate = owner.integrate
+
+        def edit_before_merge(*args):
+            (owner.integration['app'] / 'unaccounted.txt').write_text('keep integration edit')
+            return integrate(*args)
+
+        with patch.object(owner, 'integrate', side_effect=edit_before_merge):
+            result = owner.run()
+        self.assertEqual(result['status'], 'incomplete')
+        self.assertIn('adopt', result['reason'])
+        self.assertEqual(result['integration_order'], [])
+        self.assertEqual((owner.integration['app'] / 'unaccounted.txt').read_text(), 'keep integration edit')
+        self.assertNotEqual(self.cli('continue', self.report)[0], 0)
+        code, value = self.cli('adopt', self.report, '--reason', 'Retain approved integration edit')
+        self.assertEqual(code, 0, value)
+        self.assertEqual((owner.integration['app'] / 'unaccounted.txt').read_text(), 'keep integration edit')
+        self.assertEqual(self.cli('complete', self.report)[0], 0)
+
     def test_original_baseline_capture_resumes_partial_multi_repository_capture(self):
         other = self.f.make_repo('other').resolve()
         self.f.plan['repositories']['other'] = str(other)

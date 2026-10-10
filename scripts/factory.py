@@ -698,7 +698,7 @@ class Controller:
             self.save()
         raise FactoryError(f"Ticket {ticket['id']} exhausted its bounded attempts")
 
-    def verify_integration(self):
+    def verify_integration(self, findings=None):
         required = [c for tid in self.order for c in self.tickets[tid]["checks"]]
         self.report.setdefault("integration_attempts", [])
         seen = set(self.report.get("integration_progress_inputs", []))
@@ -707,6 +707,16 @@ class Controller:
         if stopped and stopped["progress"] == self.progress():
             raise FactoryError("Integration repair made no source progress; stopped")
         self.report.pop("integration_no_progress_stop", None)
+        if findings:
+            checkpoint = self.report.get("integration_findings")
+            if not checkpoint or checkpoint["evidence"] != findings:
+                checkpoint = {"evidence": findings, "progress": self.progress()}
+                self.report["integration_findings"] = checkpoint
+                self.save()
+            # A completed repair or adopted source can proceed to validation
+            # after interruption. Unchanged findings still require a repair.
+            if checkpoint["progress"] == self.progress():
+                evidence = findings
         previous = self.report["integration_attempts"][-1] if self.report["integration_attempts"] else None
         if previous:
             self.recover_validation(previous, required + self.plan["integration_checks"], "final_review")
@@ -716,9 +726,9 @@ class Controller:
             current = self.inputs()
             same_inputs = checks and all(c.get("inputs_sha256") == current for c in checks)
             if same_inputs and review and review["status"] == "changes_requested":
-                evidence = [{"review": review, "checks": self.failure_evidence(checks)}]
+                evidence += [{"review": review, "checks": self.failure_evidence(checks)}]
             elif same_inputs and any(c["status"] == "failed" for c in checks):
-                evidence = self.failure_evidence(checks)
+                evidence += self.failure_evidence(checks)
         for attempt in self.attempts():
             before = self.progress()
             pending = self.report.get("pending_source_worker")

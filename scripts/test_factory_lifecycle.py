@@ -233,6 +233,87 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(updated['run_id'], value['run_id'])
         self.assertTrue(updated['findings'][0]['resolved'])
 
+    def stop_unchanged_late_repair(self):
+        value = self.build()
+        self.f.config(no_progress=True)
+        findings = self.f.base / 'late.json'
+        findings.write_text(json.dumps(['Missing fix.txt']))
+        calls = len(self.f.calls())
+        code, result = self.cli('reopen', self.report, '--findings', findings)
+        self.assertNotEqual(code, 0, result)
+        self.assertIn('Integration repair made no source progress', result['reason'])
+        updated = json.loads(self.report.read_text())
+        self.assertEqual(updated['final_inputs'], value['final_inputs'])
+        self.assertFalse(updated['findings'][0]['resolved'])
+        self.assertFalse((Path(value['repositories']['app']['worktree']) / 'fix.txt').exists())
+        self.assertEqual([c['phase'] for c in self.f.calls()[calls:]], ['integration_repair'])
+        return updated
+
+    def test_unchanged_late_repair_stops_before_validation_and_stays_stopped(self):
+        self.stop_unchanged_late_repair()
+        calls = self.f.calls()
+        processes = json.loads((self.output / 'final' / 'report.json').read_text())['processes']
+        for _ in range(2):
+            code, result = self.cli('continue', self.report)
+            self.assertNotEqual(code, 0, result)
+            self.assertIn('Integration repair made no source progress', result['reason'])
+            self.assertFalse(json.loads(self.report.read_text())['findings'][0]['resolved'])
+        self.assertEqual(self.f.calls(), calls)
+        self.assertEqual(json.loads((self.output / 'final' / 'report.json').read_text())['processes'], processes)
+        self.assertNotEqual(self.cli('complete', self.report)[0], 0)
+
+    def test_adopted_changed_source_recovers_unchanged_late_repair(self):
+        value = self.stop_unchanged_late_repair()
+        target = Path(value['repositories']['app']['worktree']) / 'fix.txt'
+        target.write_text('approved correction')
+        calls = len(self.f.calls())
+        code, result = self.cli('adopt', self.report, '--reason', 'Retain the approved late correction')
+        self.assertEqual(code, 0, result)
+        self.assertEqual(target.read_text(), 'approved correction')
+        self.assertEqual([c['phase'] for c in self.f.calls()[calls:]], ['final_review'])
+        updated = json.loads(self.report.read_text())
+        self.assertNotEqual(updated['final_inputs'], value['final_inputs'])
+        self.assertTrue(updated['findings'][0]['resolved'])
+        self.assertEqual(self.cli('complete', self.report)[0], 0)
+
+    def recover_interrupted_late_repair(self, after_worker):
+        value = self.build()
+        findings = self.f.base / 'late.json'
+        findings.write_text(json.dumps(['Missing fix.txt']))
+        owner = factory_v2.ControllerV2(self.f.plan_path, self.output, resume=True)
+        source_worker = factory_v2.Session.source_worker
+
+        def interrupt_worker(session, phase, ticket, evidence):
+            result = source_worker(session, phase, ticket, evidence)
+            if phase == 'integration_repair':
+                raise OSError('Interrupted late repair')
+            return result
+
+        hook = (patch.object(factory_v2.Session, 'source_worker', new=interrupt_worker) if after_worker
+                else patch.object(factory_v2.Session, 'run_checks', side_effect=OSError('Interrupted late repair')))
+        with hook:
+            result = owner.run('reopen', findings=findings)
+        self.assertEqual(result['status'], 'incomplete')
+        self.assertIn('Interrupted late repair', result['reason'])
+        self.assertFalse(result['findings'][0]['resolved'])
+        target = Path(value['repositories']['app']['worktree']) / 'fix.txt'
+        self.assertEqual(target.read_text(), 'x')
+        self.f.config(no_progress=True)
+        calls = len(self.f.calls())
+        code, result = self.cli('continue', self.report)
+        self.assertEqual(code, 0, result)
+        self.assertEqual(target.read_text(), 'x')
+        self.assertEqual([c['phase'] for c in self.f.calls()[calls:]], ['final_review'])
+        self.assertEqual(sum(c['phase'] == 'integration_repair' for c in self.f.calls()), 1)
+        self.assertTrue(json.loads(self.report.read_text())['findings'][0]['resolved'])
+        self.assertEqual(self.cli('complete', self.report)[0], 0)
+
+    def test_completed_late_repair_recovers_worker_checkpoint(self):
+        self.recover_interrupted_late_repair(after_worker=True)
+
+    def test_late_repair_interrupted_before_checks_revalidates_retained_fix(self):
+        self.recover_interrupted_late_repair(after_worker=False)
+
     def test_restart_preserves_failed_worker_edits_and_attempt_logs(self):
         self.f.config(crash='a')
         self.register()

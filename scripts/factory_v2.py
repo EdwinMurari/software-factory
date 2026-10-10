@@ -594,11 +594,7 @@ class ControllerV2:
         final = Session(self, self.integration, final_output, self.plan["tickets"], baseline).restore()
         self.final_session = final
         pending = [item for item in self.report.get("findings", []) if not item.get("resolved")]
-        if pending:
-            repair = final.worker("integration_repair", None, pending)
-            if repair["status"] == "blocked":
-                raise FactoryError("Late finding repair blocked: " + repair["summary"])
-        final.verify_integration()
+        final.verify_integration(pending)
         for item in pending:
             item["resolved"] = True
         self.unchanged()

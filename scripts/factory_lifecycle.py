@@ -53,9 +53,9 @@ def known_worktrees(report):
     return {r['worktree'] for r in records}
 
 
-def retained_inputs(owner):
+def retained_inputs(owner, checkpoints=False):
     """Use the last persisted process checkpoint when finalization was interrupted."""
-    observed = {} if owner.report.get('operation_open') else dict(owner.report.get('observed_worktree_inputs', {}))
+    observed = {} if checkpoints or owner.report.get('operation_open') else dict(owner.report.get('observed_worktree_inputs', {}))
     for tid, state in owner.report['tickets'].items():
         setup = state.get('setup', {})
         records = state.get('repositories', setup.get('repositories', {}))
@@ -71,7 +71,7 @@ def retained_inputs(owner):
     final = read_json(final_path) if final_path.exists() else {}
     for name, record in owner.report['repositories'].items():
         root = Path(record['worktree'])
-        if (owner.report.get('operation_open') and record.get('head')
+        if ((checkpoints or owner.report.get('operation_open')) and record.get('head')
                 and git(root, 'rev-parse', 'HEAD').decode().strip() == record['head']
                 and not git(root, 'status', '--porcelain', '--untracked-files=all')):
             observed.setdefault(str(root), snapshot(root))
@@ -81,7 +81,7 @@ def retained_inputs(owner):
             for path, change in adoption['changes'].items():
                 observed[path] = owner.report.get('observed_worktree_inputs', {}).get(path, change['after'])
             commit_path = owner.output / 'adoptions' / str(index) / 'commit' / 'report.json'
-            if owner.report.get('operation_open') and commit_path.exists():
+            if (checkpoints or owner.report.get('operation_open')) and commit_path.exists():
                 commit = read_json(commit_path)
                 for name, value in commit.get('observed_inputs', {}).items():
                     observed[str(owner.integration[name])] = value
@@ -269,7 +269,8 @@ def complete(path):
         if state['status'] != 'integrated':
             raise FactoryError('Task is not integrated: ' + ticket['id'])
         session = read_json(path.parent / 'tasks' / ticket['id'] / 'report.json')
-        validate_verification(session, dict(plan, integration_checks=ticket['checks']), [ticket])
+        task_inputs = repository_inputs({n: Path(r['worktree']) for n, r in state['repositories'].items()})
+        validate_verification(session, dict(plan, integration_checks=ticket['checks']), [ticket], digest(encoded(task_inputs)))
         for name, record in state['repositories'].items():
             head = git(Path(record['worktree']), 'rev-parse', 'HEAD').decode().strip()
             # Recorded task commits must remain ancestors of the actual result.

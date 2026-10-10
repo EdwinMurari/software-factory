@@ -390,7 +390,19 @@ class ControllerV2:
             target = directory / name
             target.mkdir(parents=True, exist_ok=True)
             if starting is None:
-                records[name] = capture_baseline(path, target)
+                # Persist each completed capture independently. A partial attempt
+                # stays intact and cannot be mistaken for a completed baseline.
+                from factory_lifecycle import atomic
+                checkpoint = target / "captures.json"
+                saved = read_json(checkpoint) if checkpoint.exists() else {"attempts": []}
+                if "baseline" not in saved:
+                    attempt = target / str(len(saved["attempts"]) + 1)
+                    saved["attempts"].append(str(attempt))
+                    atomic(checkpoint, saved)
+                    attempt.mkdir()
+                    saved["baseline"] = capture_baseline(path, attempt)
+                    atomic(checkpoint, saved)
+                records[name] = saved["baseline"]
             else:
                 # Task worktrees start clean at a pinned commit. Rebuild only that
                 # baseline after interruption, never from later retained edits.
@@ -672,11 +684,15 @@ class ControllerV2:
                 raise FactoryError("Source changed during finalization; evidence stale")
         except (FactoryError, OSError) as exc:
             self.report.update(status="incomplete", reason=str(exc))
-        self.report["observed_worktree_inputs"] = {}
         try:
-            from factory_lifecycle import known_worktrees
-            for path in known_worktrees(self.report):
-                self.report["observed_worktree_inputs"][path] = snapshot(Path(path))
+            from factory_lifecycle import known_worktrees, retained_inputs
+            expected = retained_inputs(self, checkpoints=True)
+            actual = {path: snapshot(Path(path)) for path in known_worktrees(self.report)}
+            # Preserve the controller's checkpoints, including on failure. Saving
+            # current external edits here would silently authorize them on retry.
+            self.report["observed_worktree_inputs"] = expected
+            if actual != expected:
+                self.report.update(status="incomplete", reason="Unaccounted worktree edits; use adopt REPORT --reason TEXT to record retained edits and rerun checks and fresh review")
             self.report["evidence_files"] = [
                 {"path": str(path), "sha256": digest(path.read_bytes())}
                 for directory in ("tasks", "final", "investigations", "setup", "original-baselines", "adoptions", "history")

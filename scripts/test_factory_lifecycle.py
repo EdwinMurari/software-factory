@@ -81,6 +81,69 @@ class LifecycleTests(unittest.TestCase):
         # A source file named report.json is content, not a process checkpoint.
         self.assertEqual(self.cli('continue', self.report)[0], 0)
 
+    def test_original_baseline_capture_resumes_partial_multi_repository_capture(self):
+        other = self.f.make_repo('other').resolve()
+        self.f.plan['repositories']['other'] = str(other)
+        self.f.plan['tickets'][0]['repos'].append('other')
+        self.f.plan['checks'].append(dict(self.f.plan['checks'][0], id='other-contents', repo='other'))
+        self.f.plan['tickets'][0]['checks'].append('other-contents')
+        self.f.plan['integration_checks'].append('other-contents')
+        self.f.plan_path.write_text(json.dumps(self.f.plan))
+        self.register()
+        owner = factory_v2.ControllerV2(self.f.plan_path, self.output, resume=True)
+        capture = factory_v2.capture_baseline
+        captured = []
+
+        def interrupted(path, output):
+            result = capture(path, output)
+            if 'original-baselines' in output.parts:
+                captured.append(path)
+                if path == other:
+                    raise OSError('Interrupted during second original baseline')
+            return result
+
+        with patch.object(factory_v2, 'capture_baseline', side_effect=interrupted):
+            result = owner.run()
+        self.assertIn('Interrupted during second original baseline', result['reason'])
+        files = {p: p.read_bytes() for p in (self.output / 'original-baselines').rglob('baseline/*') if p.is_file()}
+        self.assertEqual(len(files), 2)
+        with patch.object(factory_v2, 'capture_baseline', wraps=capture) as resumed:
+            result = factory_v2.ControllerV2(self.f.plan_path, self.output, resume=True).run()
+        self.assertEqual(result['status'], 'verified', result.get('reason'))
+        self.assertEqual([call.args[0] for call in resumed.call_args_list], [other])
+        for path, content in files.items():
+            self.assertEqual(path.read_bytes(), content)
+        self.assertEqual(sum(c['phase'] == 'implement' for c in self.f.calls()), 1)
+        self.assertEqual(self.cli('complete', self.report)[0], 0)
+
+    def test_task_edit_during_final_review_requires_adoption(self):
+        self.register()
+        owner = factory_v2.ControllerV2(self.f.plan_path, self.output, resume=True)
+        worker = factory_v2.Session.worker
+
+        def edit_after_review(session, phase, *args, **kwargs):
+            result = worker(session, phase, *args, **kwargs)
+            if phase == 'final_review' and session.output == owner.output / 'final':
+                task = Path(owner.report['tickets']['a']['repositories']['app']['worktree'])
+                (task / 'a.txt').write_text('retained external edit')
+            return result
+
+        with patch.object(factory_v2.Session, 'worker', new=edit_after_review):
+            result = owner.run()
+        self.assertEqual(result['status'], 'incomplete')
+        self.assertIn('adopt', result['reason'])
+        self.assertFalse(result.get('adoptions'))
+        self.assertNotEqual(self.cli('complete', self.report)[0], 0)
+        for _ in range(2):
+            code, value = self.cli('continue', self.report)
+            self.assertNotEqual(code, 0)
+            self.assertIn('adopt', value['reason'])
+        code, value = self.cli('adopt', self.report, '--reason', 'Keep approved external task edit')
+        self.assertEqual(code, 0, value)
+        saved = json.loads(self.report.read_text())
+        self.assertEqual((Path(saved['repositories']['app']['worktree']) / 'a.txt').read_text(), 'retained external edit')
+        self.assertEqual(self.cli('complete', self.report)[0], 0)
+
     def test_late_findings_dispatch_repair_on_same_run(self):
         value = self.build()
         findings = self.f.base / 'late.json'

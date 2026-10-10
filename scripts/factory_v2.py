@@ -235,15 +235,38 @@ class Session(Controller):
                 "scope": "Only participating worktrees. Program controls commits and merges. No push, deployment or issue closing."}
 
     def worker(self, phase, ticket, evidence):
-        heads = {name: git(path, "rev-parse", "HEAD", "--abbrev-ref", "HEAD") for name, path in self.repositories.items()}
+        heads = {name: os.fsdecode(git(path, "rev-parse", "HEAD", "--abbrev-ref", "HEAD"))
+                 for name, path in self.repositories.items()}
+        pending = self.report.get("pending_source_worker")
+        if pending and pending["label"] == phase + ("-" + ticket["id"] if ticket else ""):
+            pending["heads"] = heads
+            self.save()
+        else:
+            pending = None
         result = super().worker(phase, ticket, evidence)
-        if any(git(path, "rev-parse", "HEAD", "--abbrev-ref", "HEAD") != heads[name] for name, path in self.repositories.items()):
+        if any(os.fsdecode(git(path, "rev-parse", "HEAD", "--abbrev-ref", "HEAD")) != heads[name]
+               for name, path in self.repositories.items()):
             raise FactoryError("Worker changed Git HEAD; program controls commits and merges")
+        if pending and "heads" in pending:
+            pending["heads_validated"] = True
+            self.save()
         if "review" not in phase and result["status"] != "blocked":
             if phase == "merger" and any(git(path, "ls-files", "-u") for path in self.repositories.values()):
                 raise FactoryError("Conflict repair left unresolved Git entries; resolve and stage each conflict")
             self.commit_all(f"Factory {phase}: " + (ticket["id"] if ticket else "integration"))
         return result
+
+    def recover_source_worker(self, phase, ticket):
+        # A worker result can be saved before its controlled commit finishes.
+        # Continue that commit before measuring the completed source tree.
+        pending = self.report["pending_source_worker"]
+        if not pending.get("heads_validated"):
+            if any(os.fsdecode(git(path, "rev-parse", "HEAD", "--abbrev-ref", "HEAD")) != pending["heads"][name]
+                   for name, path in self.repositories.items()):
+                raise FactoryError("Worker changed Git HEAD; program controls commits and merges")
+            pending["heads_validated"] = True
+            self.save()
+        self.commit_all(f"Factory {phase}: " + (ticket["id"] if ticket else "integration"))
 
     def git_operation(self, path, *args, allow_failure=False):
         argv = ["git", "-c", "core.hooksPath=/dev/null", "-c", "user.name=Software Factory",

@@ -556,6 +556,27 @@ class Controller:
         limit = self.plan.get("max_attempts")
         return range(limit) if limit is not None else itertools.count()
 
+    def recover_source_worker(self, phase, ticket):
+        """Finish version-specific source bookkeeping after a persisted result."""
+
+    def source_worker(self, phase, ticket, evidence):
+        # The worker result is durable before the enclosing attempt is saved.
+        # Retain the pre-dispatch content so a recovered repair is measured
+        # against its actual starting source, not its completed source.
+        pending = self.report.get("pending_source_worker")
+        label = phase + ("-" + ticket["id"] if ticket else "")
+        if pending and pending["label"] == label:
+            for record in self.report["processes"][pending["process_index"]:]:
+                if (record["phase"] == label and record["status"] == "passed"
+                        and "result" in record and record["result"]["status"] != "blocked"):
+                    self.recover_source_worker(phase, ticket)
+                    return record["result"], pending["before"]
+        before = self.progress()
+        self.report["pending_source_worker"] = {
+            "label": label, "process_index": len(self.report["processes"]), "before": before}
+        self.save()
+        return self.worker(phase, ticket, evidence), before
+
     def run_ticket(self, ticket, resume=False):
         state = self.report["tickets"][ticket["id"]]
         if state.get("no_progress_stop"):
@@ -568,7 +589,11 @@ class Controller:
             before = self.progress()
             previous = state["attempts"][-1] if retained and state["attempts"] else None
             repairing = False
-            if (attempt == 0 and previous and previous["worker"]["status"] == "complete"
+            pending = self.report.get("pending_source_worker")
+            if attempt == 0 and pending and pending["label"] in ("implement-" + ticket["id"], "repair-" + ticket["id"]):
+                repairing = pending["label"].startswith("repair-")
+                result, before = self.source_worker("repair" if repairing else "implement", ticket, evidence)
+            elif (attempt == 0 and previous and previous["worker"]["status"] == "complete"
                     and (state.get("adopted_source") or
                          (not previous.get("review")
                           and not any(c["status"] == "failed" for c in previous.get("checks", []))))):
@@ -577,11 +602,12 @@ class Controller:
                 return
             else:
                 repairing = attempt != 0 or retained
-                result = self.worker("repair" if repairing else "implement", ticket, evidence)
+                result, before = self.source_worker("repair" if repairing else "implement", ticket, evidence)
             after = self.inputs()
             progress = self.progress()
             entry = {"number": len(state["attempts"]) + 1, "worker": result, "inputs_sha256": after, "checks": [], "review": None}
             state["attempts"].append(entry)
+            self.report.pop("pending_source_worker", None)
             state.pop("adopted_source", None)
             stopped = (result["status"] != "blocked" and repairing
                        and (progress == before or progress in seen))
@@ -620,7 +646,12 @@ class Controller:
     def verify_integration(self):
         required = [c for tid in self.order for c in self.tickets[tid]["checks"]]
         self.report.setdefault("integration_attempts", [])
-        seen, evidence = set(), []
+        seen = set(self.report.get("integration_progress_inputs", []))
+        evidence = []
+        stopped = self.report.get("integration_no_progress_stop")
+        if stopped and stopped["progress"] == self.progress():
+            raise FactoryError("Integration repair made no source progress; stopped")
+        self.report.pop("integration_no_progress_stop", None)
         previous = self.report["integration_attempts"][-1] if self.report["integration_attempts"] else None
         if previous:
             checks, review = previous.get("checks", []), previous.get("review")
@@ -634,18 +665,25 @@ class Controller:
                 evidence = self.failure_evidence(checks)
         for attempt in self.attempts():
             before = self.progress()
-            if attempt or evidence:
-                repair = self.worker("integration_repair", None, evidence)
+            pending = self.report.get("pending_source_worker")
+            if attempt or evidence or (pending and pending["label"] == "integration_repair"):
+                repair, before = self.source_worker("integration_repair", None, evidence)
                 if repair["status"] == "blocked":
                     raise FactoryError("Integration repair blocked: " + repair["summary"])
                 after = self.progress()
                 if after == before or after in seen:
+                    self.report["integration_no_progress_stop"] = {"progress": after}
+                    self.report.pop("pending_source_worker", None)
+                    self.save()
                     raise FactoryError("Integration repair made no source progress; stopped")
-            seen.add(self.progress())
+            progress = self.progress()
             checks = self.run_checks(required + self.plan["integration_checks"])
             self.report["final_checks"] = checks
             entry = {"number": len(self.report["integration_attempts"]) + 1, "checks": checks, "review": None}
             self.report["integration_attempts"].append(entry)
+            seen.add(progress)
+            self.report["integration_progress_inputs"] = sorted(seen)
+            self.report.pop("pending_source_worker", None)
             self.save()
             if any(c["status"] not in ("passed", "failed") for c in checks):
                 raise FactoryError("Final check interrupted, unavailable or changed source")

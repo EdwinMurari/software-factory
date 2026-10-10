@@ -350,7 +350,7 @@ class ControllerV2:
             self.source_inputs = self.report["source_inputs"]
             self.source_branches = self.report["source_branches"]
             self.integration = {n: Path(r["worktree"]) for n, r in self.report["repositories"].items()}
-
+        self.opened_report_hash = digest(encoded(self.report)) if resume else None
 
     def save(self):
         target = self.output / "report.json"
@@ -378,6 +378,12 @@ class ControllerV2:
                 stream.close()
                 raise FactoryError(f"Another factory run holds repository lock: {path}") from exc
             self.locks.append(stream)
+        # Construction happens before locking. Reject a delayed opener before it
+        # can replace newer evidence or claims with its previously read state.
+        report_path = self.output / "report.json"
+        current_report_hash = digest(encoded(read_json(report_path))) if report_path.exists() else None
+        if current_report_hash != self.opened_report_hash:
+            raise FactoryError("Report changed before lifecycle locks were acquired; retry the operation using the current report")
         self.unchanged()
         from factory_lifecycle import claim_run
         if not self.investigate:

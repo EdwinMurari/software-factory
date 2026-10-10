@@ -542,6 +542,51 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(self.report.read_bytes(), before)
         self.assertEqual(self.cli('continue', self.report)[0], 0)
 
+    def test_delayed_lifecycle_openers_preserve_newer_completed_evidence(self):
+        import factory_lifecycle
+        self.register()
+        actions = ('continue', 'adopt', 'reopen', 'complete')
+        delayed = {action: factory_v2.ControllerV2(self.f.plan_path, self.output, resume=True)
+                   for action in actions}
+        self.assertEqual(self.cli('continue', self.report)[0], 0)
+        completed = json.loads(self.report.read_text())
+        self.assertEqual(completed['status'], 'verified')
+        self.assertTrue(completed['tickets']['a']['attempts'])
+        preserved = {p: p.read_bytes() for p in self.output.rglob('*') if p.is_file()}
+        preserved.update({Path(p): Path(p).read_bytes() for p in completed['registry_paths']})
+        calls = self.f.calls()
+        findings = self.f.base / 'late.json'
+        findings.write_text(json.dumps(['Retain the newer evidence before repairing this finding']))
+        for action, owner in delayed.items():
+            with self.subTest(action=action):
+                if action == 'complete':
+                    with patch.object(factory_v2, 'ControllerV2', return_value=owner):
+                        with self.assertRaisesRegex(factory.FactoryError, 'Report changed'):
+                            factory_lifecycle.operate(self.report, action)
+                else:
+                    result = owner.run(action, 'Retain approved edits', findings)
+                    self.assertEqual(result['status'], 'incomplete')
+                    self.assertIn('Report changed', result['reason'])
+                for path, data in preserved.items():
+                    self.assertEqual(path.read_bytes(), data, str(path))
+                self.assertEqual(self.f.calls(), calls)
+        self.assertEqual(self.cli('complete', self.report)[0], 0)
+
+    def test_delayed_new_opener_cannot_replace_completed_run(self):
+        first = factory_v2.ControllerV2(self.f.plan_path, self.output)
+        delayed = factory_v2.ControllerV2(self.f.plan_path, self.output)
+        self.assertEqual(first.run()['status'], 'verified')
+        before = self.report.read_bytes()
+        claim = Path(json.loads(before)['registry_paths'][0])
+        claim_before = claim.read_bytes()
+        calls = self.f.calls()
+        result = delayed.run('register')
+        self.assertEqual(self.report.read_bytes(), before)
+        self.assertEqual(claim.read_bytes(), claim_before)
+        self.assertEqual(result['status'], 'incomplete')
+        self.assertIn('Report changed', result['reason'])
+        self.assertEqual(self.f.calls(), calls)
+
 
 if __name__ == '__main__':
     unittest.main()

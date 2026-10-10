@@ -141,6 +141,156 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(json.loads(self.report.read_text())['run_id'], before['run_id'])
         self.assertEqual(self.cli('complete', self.report)[0], 0)
 
+    def test_final_bounded_failure_repairs_on_continuation(self):
+        self.f.plan['max_attempts'] = 1
+        self.f.plan['checks'].append({'id': 'final-only', 'repo': 'app', 'argv':
+            [sys.executable, '-c', "from pathlib import Path; assert Path('fix.txt').exists()"]})
+        self.f.plan['integration_checks'] = ['final-only']
+        self.f.plan_path.write_text(json.dumps(self.f.plan))
+        self.register()
+        self.assertNotEqual(self.cli('continue', self.report)[0], 0)
+        final_path = self.output / 'final' / 'report.json'
+        before = json.loads(final_path.read_text())
+        self.assertEqual(before['integration_attempts'][-1]['checks'][-1]['status'], 'failed')
+        code, value = self.cli('continue', self.report)
+        self.assertEqual(code, 0, value)
+        repair = next(c for c in self.f.calls() if c['phase'] == 'integration_repair')
+        self.assertIn('failed', json.dumps(repair['request']['evidence']))
+        self.assertEqual(len(json.loads(final_path.read_text())['integration_attempts']), 2)
+        self.assertEqual(self.cli('complete', self.report)[0], 0)
+
+    def test_failed_adoption_commit_resumes_without_losing_evidence(self):
+        value = self.build()
+        root = Path(value['repositories']['app']['worktree'])
+        (root / 'retained.txt').write_text('retain through failed commit')
+        owner = factory_v2.ControllerV2(self.f.plan_path, self.output, resume=True)
+        git_operation = factory_v2.Session.git_operation
+        def failed_commit(session, path, *args, **kwargs):
+            if args[0] == 'commit':
+                return git_operation(session, path, 'commit', '--invalid-factory-test-option')
+            return git_operation(session, path, *args, **kwargs)
+        with patch.object(factory_v2.Session, 'git_operation', new=failed_commit):
+            result = owner.run('adopt', 'Keep approved correction')
+        self.assertIn('Git commit failed', result['reason'])
+        saved = json.loads(self.report.read_text())
+        self.assertEqual(len(saved.get('adoptions', [])), 1)
+        captures = {p: p.read_bytes() for p in (self.output / 'adoptions').rglob('*') if p.is_file() and p.name != 'report.json'}
+        self.assertTrue(any(p.suffix == '.stderr' for p in captures))
+        code, value = self.cli('adopt', self.report, '--reason', 'Retry approved correction')
+        self.assertEqual(code, 0, value)
+        for path, content in captures.items():
+            self.assertEqual(path.read_bytes(), content)
+        self.assertEqual(len(json.loads(self.report.read_text())['adoptions']), 1)
+        self.assertEqual((root / 'retained.txt').read_text(), 'retain through failed commit')
+        self.assertFalse(factory.git(root, 'status', '--porcelain'))
+        self.assertEqual(self.cli('complete', self.report)[0], 0)
+
+    def test_interrupted_adoption_capture_retries_and_preserves_partial_files(self):
+        value = self.build()
+        root = Path(value['tickets']['a']['repositories']['app']['worktree'])
+        (root / 'retained.txt').write_text('retain despite interrupted capture')
+        owner = factory_v2.ControllerV2(self.f.plan_path, self.output, resume=True)
+        capture = factory.capture_baseline
+        def interrupted(path, output):
+            capture(path, output)
+            raise OSError('Interrupted after capture files were written')
+        # Simulate a process exit before finalization; only durable checkpoints survive.
+        def leave_checkpoint():
+            for stream in owner.locks:
+                stream.close()
+        with patch.object(factory, 'capture_baseline', side_effect=interrupted), patch.object(owner, 'finalize', side_effect=leave_checkpoint):
+            result = owner.run('adopt', 'Retain approved task correction')
+        self.assertIn('Interrupted after capture', result['reason'])
+        before = json.loads(self.report.read_text())
+        self.assertTrue(before['operation_open'])
+        captures = {p: p.read_bytes() for p in (self.output / 'adoptions').rglob('*') if p.is_file()}
+        self.assertTrue(captures)
+        code, value = self.cli('continue', self.report)
+        self.assertEqual(code, 0, value)
+        for path, content in captures.items():
+            self.assertEqual(path.read_bytes(), content)
+        saved = json.loads(self.report.read_text())
+        self.assertEqual(len(saved['adoptions']), 1)
+        change = saved['adoptions'][0]['changes'][str(root)]
+        self.assertEqual(len(change['captures']), 2)
+        self.assertEqual((Path(saved['repositories']['app']['worktree']) / 'retained.txt').read_text(), 'retain despite interrupted capture')
+        self.assertEqual(self.cli('complete', self.report)[0], 0)
+
+    def test_adoption_task_report_mutation_survives_exit_before_finalization(self):
+        import factory_lifecycle
+        value = self.build()
+        root = Path(value['tickets']['a']['repositories']['app']['worktree'])
+        (root / 'retained.txt').write_text('retained across report mutation')
+        owner = factory_v2.ControllerV2(self.f.plan_path, self.output, resume=True)
+        atomic = factory_lifecycle.atomic
+        def interrupted(path, value):
+            atomic(path, value)
+            if path == (self.output / 'tasks' / 'a' / 'report.json').resolve():
+                raise OSError('Interrupted after task report mutation')
+        def leave_checkpoint():
+            for stream in owner.locks:
+                stream.close()
+        with patch.object(factory_lifecycle, 'atomic', side_effect=interrupted), patch.object(owner, 'finalize', side_effect=leave_checkpoint):
+            result = owner.run('adopt', 'Retain approved task change')
+        self.assertIn('Interrupted after task report mutation', result['reason'])
+        code, value = self.cli('continue', self.report)
+        self.assertEqual(code, 0, value)
+        saved = json.loads(self.report.read_text())
+        self.assertEqual(len(saved['adoptions']), 1)
+        self.assertEqual((Path(saved['repositories']['app']['worktree']) / 'retained.txt').read_text(), 'retained across report mutation')
+        self.assertEqual(self.cli('complete', self.report)[0], 0)
+
+    def test_final_bounded_review_finding_repairs_on_continuation(self):
+        self.f.plan['max_attempts'] = 1
+        self.f.plan_path.write_text(json.dumps(self.f.plan))
+        self.f.fake.write_text(self.f.fake.read_text().replace(
+            "if control.get('findings') and 'review' in phase",
+            "if phase == 'final_review' and '/integration/' in str(next(iter(paths.values())))"))
+        self.register()
+        self.assertNotEqual(self.cli('continue', self.report)[0], 0)
+        final_path = self.output / 'final' / 'report.json'
+        before = json.loads(final_path.read_text())
+        self.assertEqual(before['integration_attempts'][-1]['review']['issues'], ['Missing fix.txt'])
+        code, value = self.cli('continue', self.report)
+        self.assertEqual(code, 0, value)
+        repair = next(c for c in self.f.calls() if c['phase'] == 'integration_repair')
+        self.assertIn('Missing fix.txt', json.dumps(repair['request']['evidence']))
+        self.assertEqual(len(json.loads(final_path.read_text())['integration_attempts']), 2)
+
+    def test_setup_only_worktree_edits_require_adoption(self):
+        self.register()
+        owner = factory_v2.ControllerV2(self.f.plan_path, self.output, resume=True)
+        original = owner.worktree
+        def interrupted(name, source, role, base):
+            result = original(name, source, role, base)
+            if role == 'task-a':
+                raise OSError('Interrupted before task setup checkpoint')
+            return result
+        def leave_checkpoint():
+            for stream in owner.locks:
+                stream.close()
+        with patch.object(owner, 'worktree', side_effect=interrupted), patch.object(owner, 'finalize', side_effect=leave_checkpoint):
+            result = owner.run()
+        self.assertIn('Interrupted before task setup', result['reason'])
+        setup = next(r for r in result['worktree_setups'] if r['role'] == 'task-a')
+        root = Path(setup['worktree'])
+        (root / 'retained.txt').write_text('retain setup-only content')
+        self.f.git(root, 'add', '.')
+        self.f.git(root, 'commit', '-qm', 'Out of run edit')
+        code, value = self.cli('continue', self.report)
+        self.assertNotEqual(code, 0)
+        self.assertIn('adopt', value['reason'])
+        (root / 'dirty.txt').write_text('also retain uncommitted content')
+        code, value = self.cli('adopt', self.report, '--reason', 'Keep approved setup changes')
+        self.assertEqual(code, 0, value)
+        saved = json.loads(self.report.read_text())
+        integrated = Path(saved['repositories']['app']['worktree'])
+        self.assertEqual((integrated / 'retained.txt').read_text(), 'retain setup-only content')
+        self.assertEqual((integrated / 'dirty.txt').read_text(), 'also retain uncommitted content')
+        session = json.loads((self.output / 'tasks' / 'a' / 'report.json').read_text())
+        self.assertEqual(session['baseline']['app']['head'], setup['base_sha'])
+        self.assertEqual(self.cli('complete', self.report)[0], 0)
+
     def interrupt_task_baseline(self):
         self.register()
         owner = factory_v2.ControllerV2(self.f.plan_path, self.output, resume=True)

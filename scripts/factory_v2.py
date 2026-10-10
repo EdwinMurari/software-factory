@@ -420,7 +420,8 @@ class ControllerV2:
         # All mutations occur on the coordinator thread, except isolated task commits.
         helper = Session(self, {name: source}, self.output / "setup" / role / name, [], {})
         record = {"branch": branch, "worktree": str(path), "base_sha": base}
-        setup = {"repo": name, "role": role, **record, "status": "pending", "report": str(helper.output / "report.json")}
+        setup = {"repo": name, "role": role, **record, "status": "pending", "report": str(helper.output / "report.json"),
+                 "base_inputs": snapshot(self.integration[name] if role.startswith("task-") else source)}
         self.report.setdefault("worktree_setups", []).append(setup)
         self.save()
         try:
@@ -463,10 +464,11 @@ class ControllerV2:
             for name in sorted(ticket["repos"]):
                 base = os.fsdecode(git(self.integration[name], "rev-parse", "HEAD")).strip()
                 path, record = self.worktree(name, self.sources[name], "task-" + ticket["id"], base)
-                if git(path, "status", "--porcelain", "--untracked-files=all"):
-                    raise FactoryError("Task worktree changed before its starting checkpoint")
                 repositories[name], records[name] = path, record
-            setup = {"repositories": records, "inputs": repository_inputs(repositories)}
+            retained = [r for r in self.report["worktree_setups"] if r["role"] == "task-" + ticket["id"]]
+            pinned = {r["repo"]: r["base_inputs"] for r in retained}
+            setup = {"repositories": records, "inputs": pinned,
+                     "adopted_inputs": {r["repo"]: r.get("adopted_inputs", r["base_inputs"]) for r in retained}}
             state["setup"] = setup
             self.save()
         output = self.output / "tasks" / ticket["id"]

@@ -566,9 +566,16 @@ class Controller:
         required = [c for tid in self.order for c in self.tickets[tid]["checks"]]
         self.report.setdefault("integration_attempts", [])
         seen, evidence = set(), []
+        previous = self.report["integration_attempts"][-1] if self.report["integration_attempts"] else None
+        if previous:
+            checks, review = previous.get("checks", []), previous.get("review")
+            if review and review["status"] == "changes_requested":
+                evidence = [{"review": review, "checks": self.failure_evidence(checks)}]
+            elif any(c["status"] == "failed" for c in checks):
+                evidence = self.failure_evidence(checks)
         for attempt in self.attempts():
             before = self.progress()
-            if attempt:
+            if attempt or evidence:
                 repair = self.worker("integration_repair", None, evidence)
                 if repair["status"] == "blocked":
                     raise FactoryError("Integration repair blocked: " + repair["summary"])
@@ -580,6 +587,7 @@ class Controller:
             self.report["final_checks"] = checks
             entry = {"number": len(self.report["integration_attempts"]) + 1, "checks": checks, "review": None}
             self.report["integration_attempts"].append(entry)
+            self.save()
             if any(c["status"] not in ("passed", "failed") for c in checks):
                 raise FactoryError("Final check interrupted, unavailable or changed source")
             if not all(c["status"] == "passed" for c in checks):

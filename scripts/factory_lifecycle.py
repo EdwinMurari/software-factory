@@ -49,6 +49,7 @@ def known_worktrees(report):
     records = list(report['repositories'].values())
     for state in report['tickets'].values():
         records.extend(state.get('repositories', state.get('setup', {}).get('repositories', {})).values())
+    records.extend(r for r in report.get('worktree_setups', []) if Path(r['worktree']).exists())
     return {r['worktree'] for r in records}
 
 
@@ -65,7 +66,7 @@ def retained_inputs(owner):
                 observed.setdefault(record['worktree'], session['observed_inputs'][name])
         else:
             for name, record in records.items():
-                observed.setdefault(record['worktree'], setup['inputs'][name])
+                observed.setdefault(record['worktree'], setup.get('adopted_inputs', setup['inputs'])[name])
     final_path = owner.output / 'final' / 'report.json'
     final = read_json(final_path) if final_path.exists() else {}
     for name, record in owner.report['repositories'].items():
@@ -75,6 +76,18 @@ def retained_inputs(owner):
                 and not git(root, 'status', '--porcelain', '--untracked-files=all')):
             observed.setdefault(str(root), snapshot(root))
         observed.setdefault(record['worktree'], final.get('observed_inputs', {}).get(name, owner.source_inputs[name]))
+    for index, adoption in enumerate(owner.report.get('adoptions', []), 1):
+        if adoption.get('status') == 'pending':
+            for path, change in adoption['changes'].items():
+                observed[path] = owner.report.get('observed_worktree_inputs', {}).get(path, change['after'])
+            commit_path = owner.output / 'adoptions' / str(index) / 'commit' / 'report.json'
+            if owner.report.get('operation_open') and commit_path.exists():
+                commit = read_json(commit_path)
+                for name, value in commit.get('observed_inputs', {}).items():
+                    observed[str(owner.integration[name])] = value
+    for setup in owner.report.get('worktree_setups', []):
+        if Path(setup['worktree']).exists():
+            observed.setdefault(setup['worktree'], setup.get('adopted_inputs', setup['base_inputs']))
     return observed
 
 
@@ -95,61 +108,96 @@ def require_workers_stopped(output):
                     raise FactoryError('An interrupted worker may still be running (PID ' + str(process['pid']) + '); wait for its exit before continuation')
 
 
+def finish_adoption(owner, adoption):
+    """Resume a recorded adoption; incomplete captures and Git logs stay on disk."""
+    from factory import capture_baseline
+    from factory_v2 import Session
+    directory = owner.output / 'adoptions' / str(owner.report['adoptions'].index(adoption) + 1)
+    for number, (path, change) in enumerate(sorted(adoption['changes'].items())):
+        if 'snapshot' in change:
+            continue
+        # A failed capture may have partial files. Allocate another capture instead
+        # of overwriting that evidence or treating its presence as success.
+        captures = change.setdefault('captures', [])
+        output = directory / str(number) / str(len(captures) + 1)
+        captures.append(str(output))
+        owner.save()
+        output.mkdir(parents=True)
+        change['snapshot'] = capture_baseline(Path(path), output)
+        owner.save()
+    for setup in owner.report.get('worktree_setups', []):
+        if setup['worktree'] in adoption['changes']:
+            setup['adopted_inputs'] = adoption['changes'][setup['worktree']]['after']
+            if setup['role'] == 'integration' and setup['repo'] not in owner.integration:
+                owner.integration[setup['repo']] = Path(setup['worktree'])
+                owner.report['repositories'][setup['repo']] = {key: setup[key] for key in ('branch', 'worktree', 'base_sha')}
+    owner.save()
+    for tid, state in owner.report['tickets'].items():
+        records = state.get('repositories', state.get('setup', {}).get('repositories', {}))
+        if any(r['worktree'] in adoption['changes'] for r in records.values()):
+            state['status'] = 'incomplete'
+            if 'setup' in state:
+                state['setup']['adopted_inputs'] = {name: snapshot(Path(r['worktree'])) for name, r in records.items()}
+            owner.save()
+            session_path = owner.output / 'tasks' / tid / 'report.json'
+            if session_path.exists():
+                session = read_json(session_path)
+                session['tickets'][tid]['status'] = 'incomplete'
+                session['observed_inputs'] = {name: snapshot(Path(r['worktree'])) for name, r in records.items()}
+                atomic(session_path, session)
+    if any(p in adoption['changes'] for p in map(str, owner.integration.values())):
+        session = Session(owner, owner.integration, directory / 'commit', [], {}).restore()
+        session.commit_all('Factory adopt: ' + adoption['reason'])
+        for name, root in owner.integration.items():
+            owner.report['repositories'][name]['head'] = git(root, 'rev-parse', 'HEAD').decode().strip()
+    adoption['status'] = 'complete'
+    owner.save()
+
+
 def prepare_operation(owner, action, reason, findings):
     if owner.investigate:
         return
     if owner.resuming:
         references_unchanged(owner.report['dependencies'] + owner.report.get('evidence_files', []))
         require_workers_stopped(owner.output)
+        pending = next((a for a in owner.report.get('adoptions', []) if a.get('status') == 'pending'), None)
         expected = retained_inputs(owner)
         actual = {p: snapshot(Path(p)) for p in known_worktrees(owner.report)}
         changed = {p: {'before': expected.get(p), 'after': value} for p, value in actual.items() if value != expected.get(p)}
         if changed and action != 'adopt':
             raise FactoryError('Unaccounted worktree edits; use adopt REPORT --reason TEXT to record retained edits and rerun checks and fresh review')
+        if pending and changed:
+            raise FactoryError('Pending adoption inputs changed; preserve the new edits and restore the recorded inputs before retrying adoption')
         if action == 'adopt':
             text(reason, 'adoption reason')
-            if not changed:
+            if not changed and not pending:
                 raise FactoryError('No unaccounted worktree edits to adopt')
-            # Capture content, not only a new fingerprint, before validating retained edits.
-            index = len(owner.report.get('adoptions', [])) + 1
-            records = {}
-            for number, (path, change) in enumerate(sorted(changed.items())):
-                output = owner.output / 'adoptions' / str(index) / str(number)
-                output.mkdir(parents=True)
-                from factory import capture_baseline
-                records[path] = dict(change, snapshot=capture_baseline(Path(path), output))
-            owner.report.setdefault('adoptions', []).append({'at_aest': now(), 'reason': reason, 'changes': records})
-            for tid, state in owner.report['tickets'].items():
-                if any(r['worktree'] in changed for r in state.get('repositories', state.get('setup', {}).get('repositories', {})).values()):
-                    # Integrated task edits must flow through integration again.
-                    state['status'] = 'incomplete'
-                    session_path = owner.output / 'tasks' / tid / 'report.json'
-                    if session_path.exists():
-                        session = read_json(session_path)
-                        session['tickets'][tid]['status'] = 'incomplete'
-                        atomic(session_path, session)
-            owner.report['observed_worktree_inputs'] = actual
+        values = None
         if action == 'reopen':
             values = read_json(findings)
             if not isinstance(values, list) or not values or any(not isinstance(v, str) or not v.strip() for v in values):
                 raise FactoryError('Findings must be a nonempty JSON array of concrete issue strings')
-            owner.report.setdefault('findings', []).append({'at_aest': now(), 'issues': values,
-                                                          'source_sha256': digest(Path(findings).read_bytes()), 'resolved': False})
         history = owner.output / 'history'
         history.mkdir(exist_ok=True)
         atomic(history / (str(len(owner.report.get('operations', []))) + '.json'), read_json(owner.output / 'report.json'))
-        # Old logs remain immutable. The live session reports are checkpointed anew.
+        # Persist ownership before changing evidence files or source. A failed
+        # capture, report edit or commit must leave a retryable operation.
         owner.report.pop('evidence_files', None)
         owner.report['operation_open'] = True
         owner.report.setdefault('operations', []).append({'action': action, 'at_aest': now()})
         owner.report['status'] = 'incomplete'
         owner.report.pop('reason', None)
-        # Commit adopted integration edits through the same program-owned Git path.
-        if action == 'adopt' and any(p in changed for p in map(str, owner.integration.values())):
-            from factory_v2 import Session
-            session = Session(owner, owner.integration, owner.output / 'adoptions' / str(index) / 'commit', [], {})
-            session.commit_all('Factory adopt: ' + reason)
+        if action == 'adopt' and not pending:
+            pending = {'at_aest': now(), 'reason': reason, 'changes': changed, 'status': 'pending'}
+            owner.report.setdefault('adoptions', []).append(pending)
+            owner.report['observed_worktree_inputs'] = actual
+        if values:
+            owner.report.setdefault('findings', []).append({'at_aest': now(), 'issues': values,
+                                                          'source_sha256': digest(Path(findings).read_bytes()), 'resolved': False})
         owner.save()
+        owner.operation_ready = True
+        if pending:
+            finish_adoption(owner, pending)
     else:
         owner.report['operations'] = [{'action': 'register', 'at_aest': now()}]
         owner.save()
@@ -234,6 +282,8 @@ def complete(path):
     validate_verification(final, plan, plan['tickets'], digest(encoded(exact)))
     if report['final_checks'] != final['final_checks'] or report['final_review'] != final['final_review']:
         raise FactoryError('Final evidence differs from saved session')
+    if any(a.get('status') == 'pending' for a in report.get('adoptions', [])):
+        raise FactoryError('Unfinished adoption; continue its retained operation')
     if any(not f['resolved'] for f in report.get('findings', [])):
         raise FactoryError('Unresolved late findings')
     if report['status'] != 'verified':

@@ -524,7 +524,9 @@ class Controller:
         for attempt in self.attempts():
             before = self.progress()
             previous = state["attempts"][-1] if retained and state["attempts"] else None
-            if attempt == 0 and previous and previous["worker"]["status"] == "complete" and not previous.get("review"):
+            if (attempt == 0 and previous and previous["worker"]["status"] == "complete"
+                    and not previous.get("review")
+                    and not any(c["status"] == "failed" for c in previous.get("checks", []))):
                 result = previous["worker"]
             elif attempt == 0 and retained and state.get("status") == "verified":
                 return

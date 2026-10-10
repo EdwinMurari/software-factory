@@ -384,12 +384,25 @@ class ControllerV2:
             claim_run(self)
         self.acquired = True
 
-    def baseline(self, repositories, directory):
+    def baseline(self, repositories, directory, starting=None):
         records = {}
         for name, path in repositories.items():
             target = directory / name
             target.mkdir(parents=True, exist_ok=True)
-            records[name] = capture_baseline(path, target)
+            if starting is None:
+                records[name] = capture_baseline(path, target)
+            else:
+                # Task worktrees start clean at a pinned commit. Rebuild only that
+                # baseline after interruption, never from later retained edits.
+                baseline = target / "baseline"
+                baseline.mkdir(exist_ok=True)
+                patch = baseline / "tracked.patch"
+                if patch.exists() and patch.read_bytes():
+                    raise FactoryError("Clean task baseline contains unexpected edits")
+                patch.write_bytes(b"")
+                records[name] = {"head": starting["repositories"][name]["base_sha"],
+                                 "inputs_sha256": starting["inputs"][name],
+                                 "tracked_patch": str(patch), "untracked": []}
         return records
 
     def worktree(self, name, source, role, base):
@@ -441,15 +454,30 @@ class ControllerV2:
             output = self.output / "tasks" / ticket["id"]
             previous = read_json(output / "report.json")
             return Session(self, repositories, output, [ticket], previous["baseline"]).restore()
-        for name in sorted(ticket["repos"]):
-            base = os.fsdecode(git(self.integration[name], "rev-parse", "HEAD")).strip()
-            path, record = self.worktree(name, self.sources[name], "task-" + ticket["id"], base)
-            repositories[name], records[name] = path, record
+        state = self.report["tickets"][ticket["id"]]
+        setup = state.get("setup")
+        if setup:
+            records = setup["repositories"]
+            repositories = {n: Path(r["worktree"]) for n, r in records.items()}
+        else:
+            for name in sorted(ticket["repos"]):
+                base = os.fsdecode(git(self.integration[name], "rev-parse", "HEAD")).strip()
+                path, record = self.worktree(name, self.sources[name], "task-" + ticket["id"], base)
+                if git(path, "status", "--porcelain", "--untracked-files=all"):
+                    raise FactoryError("Task worktree changed before its starting checkpoint")
+                repositories[name], records[name] = path, record
+            setup = {"repositories": records, "inputs": repository_inputs(repositories)}
+            state["setup"] = setup
+            self.save()
         output = self.output / "tasks" / ticket["id"]
-        output.mkdir(parents=True)
-        session = Session(self, repositories, output, [ticket], self.baseline(repositories, output))
-        self.report["tickets"][ticket["id"]]["repositories"] = records
-        session.save()
+        output.mkdir(parents=True, exist_ok=True)
+        if (output / "report.json").exists():
+            previous = read_json(output / "report.json")
+            session = Session(self, repositories, output, [ticket], previous["baseline"]).restore()
+        else:
+            session = Session(self, repositories, output, [ticket], self.baseline(repositories, output, setup))
+            session.save()
+        state["repositories"] = records
         self.save()
         return session
 

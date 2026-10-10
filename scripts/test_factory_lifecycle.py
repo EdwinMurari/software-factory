@@ -5,6 +5,7 @@ import subprocess
 import sys
 import unittest
 import fcntl
+from unittest.mock import patch
 
 import factory
 import factory_v2
@@ -123,6 +124,68 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(code, 0, value)
         self.assertEqual(sum(c['phase'] == 'implement' for c in self.f.calls()), 1)
         self.assertNotIn('repair', [c['phase'] for c in self.f.calls()])
+
+    def test_bounded_failed_check_continues_with_repair(self):
+        self.f.plan['max_attempts'] = 1
+        self.f.plan['checks'][0]['argv'] = [sys.executable, '-c',
+                                          "from pathlib import Path; assert Path('fix.txt').exists()"]
+        self.f.plan_path.write_text(json.dumps(self.f.plan))
+        self.register()
+        self.assertNotEqual(self.cli('continue', self.report)[0], 0)
+        before = json.loads(self.report.read_text())
+        self.assertEqual([c['phase'] for c in self.f.calls()], ['implement'])
+        code, value = self.cli('continue', self.report)
+        self.assertEqual(code, 0, value)
+        repair = next(c for c in self.f.calls() if c['phase'] == 'repair')
+        self.assertIn('failed', json.dumps(repair['request']['evidence']))
+        self.assertEqual(json.loads(self.report.read_text())['run_id'], before['run_id'])
+        self.assertEqual(self.cli('complete', self.report)[0], 0)
+
+    def interrupt_task_baseline(self):
+        self.register()
+        owner = factory_v2.ControllerV2(self.f.plan_path, self.output, resume=True)
+        original = owner.baseline
+
+        def interrupted(repositories, directory, *args, **kwargs):
+            if directory == (self.output / 'tasks' / 'a').resolve():
+                (directory / 'app' / 'baseline').mkdir(parents=True, exist_ok=True)
+                raise OSError('Interrupted task baseline capture')
+            return original(repositories, directory, *args, **kwargs)
+
+        with patch.object(owner, 'baseline', side_effect=interrupted):
+            result = owner.run()
+        self.assertEqual(result['status'], 'incomplete')
+        self.assertIn('Interrupted task baseline', result['reason'])
+        self.assertEqual(self.f.calls(), [])
+        return result
+
+    def test_interrupted_task_baseline_continues_on_same_run(self):
+        before = self.interrupt_task_baseline()
+        code, value = self.cli('continue', self.report)
+        self.assertEqual(code, 0, value)
+        self.assertEqual(json.loads(self.report.read_text())['run_id'], before['run_id'])
+        self.assertEqual(sum(c['phase'] == 'implement' for c in self.f.calls()), 1)
+        self.assertEqual(self.cli('complete', self.report)[0], 0)
+
+    def test_interrupted_task_baseline_retains_edits_only_after_adoption(self):
+        before = self.interrupt_task_baseline()
+        setup = next(r for r in before['worktree_setups'] if r['role'] == 'task-a')
+        task = Path(setup['worktree'])
+        (task / 'retained.txt').write_text('explicit retained change')
+        code, value = self.cli('continue', self.report)
+        self.assertNotEqual(code, 0)
+        self.assertIn('adopt', value['reason'])
+        code, value = self.cli('adopt', self.report, '--reason', 'Retain approved correction')
+        self.assertEqual(code, 0, value)
+        report = json.loads(self.report.read_text())
+        integrated = Path(report['repositories']['app']['worktree'])
+        self.assertEqual((integrated / 'retained.txt').read_text(), 'explicit retained change')
+        session = json.loads((self.output / 'tasks' / 'a' / 'report.json').read_text())
+        self.assertEqual(session['baseline']['app']['head'], setup['base_sha'])
+        self.assertEqual(session['baseline']['app']['untracked'], [])
+        self.assertEqual(Path(session['baseline']['app']['tracked_patch']).read_text(), '')
+        self.assertTrue(report['adoptions'])
+        self.assertEqual(self.cli('complete', self.report)[0], 0)
 
     def test_task_worktree_edits_return_through_integration(self):
         value = self.build()

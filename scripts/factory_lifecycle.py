@@ -48,7 +48,7 @@ def finish_claim(owner):
 def known_worktrees(report):
     records = list(report['repositories'].values())
     for state in report['tickets'].values():
-        records.extend(state.get('repositories', {}).values())
+        records.extend(state.get('repositories', state.get('setup', {}).get('repositories', {})).values())
     return {r['worktree'] for r in records}
 
 
@@ -56,11 +56,16 @@ def retained_inputs(owner):
     """Use the last persisted process checkpoint when finalization was interrupted."""
     observed = {} if owner.report.get('operation_open') else dict(owner.report.get('observed_worktree_inputs', {}))
     for tid, state in owner.report['tickets'].items():
-        records = state.get('repositories', {})
-        if records:
-            session = read_json(owner.output / 'tasks' / tid / 'report.json')
+        setup = state.get('setup', {})
+        records = state.get('repositories', setup.get('repositories', {}))
+        session_path = owner.output / 'tasks' / tid / 'report.json'
+        if records and session_path.exists():
+            session = read_json(session_path)
             for name, record in records.items():
                 observed.setdefault(record['worktree'], session['observed_inputs'][name])
+        else:
+            for name, record in records.items():
+                observed.setdefault(record['worktree'], setup['inputs'][name])
     final_path = owner.output / 'final' / 'report.json'
     final = read_json(final_path) if final_path.exists() else {}
     for name, record in owner.report['repositories'].items():
@@ -115,13 +120,14 @@ def prepare_operation(owner, action, reason, findings):
                 records[path] = dict(change, snapshot=capture_baseline(Path(path), output))
             owner.report.setdefault('adoptions', []).append({'at_aest': now(), 'reason': reason, 'changes': records})
             for tid, state in owner.report['tickets'].items():
-                if any(r['worktree'] in changed for r in state.get('repositories', {}).values()):
+                if any(r['worktree'] in changed for r in state.get('repositories', state.get('setup', {}).get('repositories', {})).values()):
                     # Integrated task edits must flow through integration again.
                     state['status'] = 'incomplete'
                     session_path = owner.output / 'tasks' / tid / 'report.json'
-                    session = read_json(session_path)
-                    session['tickets'][tid]['status'] = 'incomplete'
-                    atomic(session_path, session)
+                    if session_path.exists():
+                        session = read_json(session_path)
+                        session['tickets'][tid]['status'] = 'incomplete'
+                        atomic(session_path, session)
             owner.report['observed_worktree_inputs'] = actual
         if action == 'reopen':
             values = read_json(findings)

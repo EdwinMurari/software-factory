@@ -1,11 +1,17 @@
 ---
 name: software-factory
-description: Build product features, fix app bugs, and improve performance through clear acceptance scenarios, small implementation tasks, measured checks, and review. Use for coding work in new or existing projects; scale the workflow to the change.
+description: Build desired product outcomes or investigate and improve supplied audit points, with recorded product decisions, isolated tasks, measured checks, and fresh review. Use for coding work in new or existing projects; scale the workflow to the change.
 ---
 
 # Software Factory
 
 Turn the user's intended outcome into a working, checked change. The user owns product choices. You own routine engineering within that agreement. Follow the existing project conventions and use its commands. Keep one authoritative implementation per behaviour.
+
+## Choose the input
+
+Accept either a desired product outcome or an audit to investigate and improve. For audits, preserve every original point and source. Optional groups need a reason. Read [isolated-runner.md](references/isolated-runner.md) and dispatch fresh read-only investigations. Retain confirmed, disproved and blocked findings, evidence and product questions. Ask the user about one material choice at a time. Record the actual decision reference, including approved deferrals; an investigation result is never approval. Map every point to tasks or an explicit disposition. Blocked points keep the overall work incomplete. Desired outcomes need no artificial audit points.
+
+Use the installed `ask-matt` router to choose external skills within the current stage. Read each selected skill before applying it. The runner enforces execution gates; it does not select workflows or make product decisions.
 
 ## Agree on the result
 
@@ -18,10 +24,8 @@ Completion of this stage means an implementer can distinguish the requested resu
 ## Choose the smallest useful loop
 
 - **Small change:** work in the current session. Use existing focused checks and inspect the result. A copy or style change does not need a ticket graph or new tests.
-- **Substantial change:** make small tasks that each deliver observable behaviour. Declare dependencies and acceptance criteria. Read [runner.md](references/runner.md) and use the on-demand runner for fresh worker sessions and deterministic checks. The runner is shared; commands and product requirements belong to the project.
+- **Substantial change:** make small tasks that each deliver observable behaviour. Declare dependencies and acceptance criteria. Read [runner.md](references/runner.md) for v1 or [isolated-runner.md](references/isolated-runner.md) for v2 and use the on-demand runner for fresh worker sessions and deterministic checks. The runner is shared; commands and product requirements belong to the project.
 - **Factory worker:** if this session was launched for an assigned implementation, repair, or review stage, do that stage and return the requested result. Do not launch another factory or expand the ticket.
-
-Use the installed `ask-matt` skill as the source for selecting Matt's skills and flows. Read the selected skill before applying it within the agreed scope and current factory stage. Keep skill selection there rather than maintaining a second catalogue in the factory.
 
 Read [quality.md](references/quality.md) when choosing tests, reviewing a change, or handling failed checks. Read [performance.md](references/performance.md) when the change affects responsiveness, caching, large data, background work, or CI cost.
 

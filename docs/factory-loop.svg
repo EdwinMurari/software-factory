@@ -1,11 +1,11 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1080" height="565" viewBox="0 0 1080 565" role="img" aria-labelledby="title desc">
-<title id="title">Software factory review and repair loop</title>
+<title id="title">Software factory shared build loop after intake and scheduling</title>
 <desc id="desc">Make a change, run checks, and review in a fresh session. Failed checks or review findings feed repairs and another pass. Verification requires passing checks, verified criteria, and no findings. Blockers, timeouts and no progress are incomplete outcomes.</desc>
 <defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 1 1 L 9 5 L 1 9" fill="none" stroke="#24384b" stroke-width="1.5"/></marker></defs>
 <rect width="1080" height="565" rx="16" fill="#ffffff"/>
 <g font-family="'Comic Sans MS', 'Trebuchet MS', sans-serif">
 <text x="40" y="55.0" font-size="30" fill="#24384b">Build. Check. Review. Repair.</text>
-<text x="40" y="91.0" font-size="18" fill="#24384b">For each task — and again after integration.</text>
+<text x="40" y="91.0" font-size="18" fill="#24384b">Build loop after intake: each task, then integration.</text>
 <path d="M52 155 Q40 154 40 167 L41 231 Q40 243 52 243 L213 242 Q225 243 225 231 L224 167 Q225 155 213 156 Z" fill="#e7efff" stroke="#24384b" stroke-width="2"/>
 <text x="58" y="202.0" font-size="22" fill="#24384b">Make a change</text>
 <path d="M317 155 Q305 154 305 167 L306 231 Q305 243 317 243 L443 242 Q455 243 455 231 L454 167 Q455 155 443 156 Z" fill="#e7efff" stroke="#24384b" stroke-width="2"/>

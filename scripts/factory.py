@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""On-demand, sequential Git ticket controller. Python 3.10+, Git, POSIX.
+"""On-demand Git task controller with v1 checkout and v2 isolated execution.
 
 The controller verifies process exits and evidence freshness. It does not prove
 bug freedom, approve product decisions, sandbox commands, or deploy software.
@@ -7,6 +7,7 @@ bug freedom, approve product decisions, sandbox commands, or deploy software.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import itertools
 import json
@@ -17,6 +18,7 @@ import signal
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 from datetime import datetime, timedelta, timezone
@@ -108,6 +110,12 @@ def git(project, *args):
     return result.stdout
 
 
+def repository_lock_path(project):
+    common = os.fsdecode(git(project, "rev-parse", "--git-common-dir")).strip()
+    directory = (Path(project) / common).resolve()
+    return Path(tempfile.gettempdir()) / f"software-factory-{os.getuid()}-{digest(os.fsencode(directory))[:24]}.lock"
+
+
 def snapshot(project):
     """Hash index entries, HEAD and all tracked/nonignored worktree inputs.
 
@@ -116,7 +124,7 @@ def snapshot(project):
     """
     index = git(project, "ls-files", "--stage", "-z")
     if any(entry.startswith(b"160000 ") for entry in index.split(b"\0")):
-        raise FactoryError("v1 does not support Git submodules")
+        raise FactoryError("Git submodules are unsupported")
     head = git(project, "rev-parse", "--verify", "HEAD")
     paths = set(git(project, "ls-files", "--cached", "--others", "--exclude-standard", "-z").split(b"\0"))
     records = []
@@ -142,6 +150,16 @@ def load_plan(path):
     path = Path(path).resolve()
     raw = path.read_bytes()
     plan = read_json(path)
+    if not isinstance(plan, dict):
+        raise FactoryError("Plan must be an object")
+    if plan.get("version") == 2:
+        from factory_v2 import load_plan as load_v2
+        value, repositories, plan_hash, order = load_v2(path, investigate="tickets" not in plan)
+        return value, next(iter(repositories.values())), plan_hash, order
+    return validate_v1(plan, path, digest(raw))
+
+
+def validate_v1(plan, path, plan_hash):
     keys(plan, ["version", "project", "worker", "checks", "tickets", "integration_checks"],
          ["max_attempts", "worker_timeout_seconds", "run_timeout_seconds", "pending_decisions"])
     if type(plan["version"]) is not int or plan["version"] != 1:
@@ -222,7 +240,7 @@ def load_plan(path):
         order.extend(ready)
         remaining.difference_update(ready)
     snapshot(project)
-    return plan, project, digest(raw), order
+    return plan, project, plan_hash, order
 
 
 def validate_result(value, expected):
@@ -317,13 +335,22 @@ class Controller:
         self.report = {
             "version": 1, "status": "incomplete", "started_at_aest": now(),
             "project": str(self.project), "plan_path": str(self.plan_path), "plan_sha256": self.plan_hash,
-            "initial_inputs_sha256": snapshot(self.project), "final_inputs_sha256": None,
+            "initial_inputs_sha256": self.inputs(), "final_inputs_sha256": None,
             "controller_sha256": digest(Path(__file__).read_bytes()),
             "tickets": {tid: {"status": "pending", "attempts": []} for tid in self.order},
             "processes": [], "final_checks": [], "final_review": None,
             "claim": "Checks and structured review only; not bug freedom or product approval.",
         }
         self.report["baseline"] = capture_baseline(self.project, self.output)
+
+    def adapter_directories(self):
+        return []
+
+    def inputs(self):
+        return snapshot(self.project)
+
+    def progress(self):
+        return self.inputs()
 
     def save(self):
         target = self.output / "report.json"
@@ -337,7 +364,7 @@ class Controller:
 
     def execute(self, argv, label, timeout, stdin=b"", readonly=False):
         self.plan_unchanged()
-        before = snapshot(self.project)
+        before = self.inputs()
         available = min(timeout, self.deadline - time.monotonic())
         if available <= 0:
             raise FactoryError("Run wall-clock budget exhausted")
@@ -367,7 +394,7 @@ class Controller:
             if proc is not None:
                 kill_group(proc)
             record["finished_at_aest"] = now()
-            record["after_inputs_sha256"] = snapshot(self.project)
+            record["after_inputs_sha256"] = self.inputs()
             if readonly and before != record["after_inputs_sha256"]:
                 record["status"] = "source_changed"
             self.save()
@@ -378,7 +405,7 @@ class Controller:
         results = []
         for cid in dict.fromkeys(ids):
             self.plan_unchanged()
-            current = snapshot(self.project)
+            current = self.inputs()
             check = self.checks[cid]
             key = (digest(encoded({"argv": check["argv"], "timeout": check.get("timeout_seconds", 120)})), current)
             if check.get("cache", False) and key in self.cache:
@@ -424,9 +451,19 @@ class Controller:
                    "failure evidence. Do not weaken checks to obtain a pass. Report limitations honestly.")
             ),
         }
+        request.update(self.worker_context(phase, ticket))
+        return self.invoke(request, phase + ("-" + ticket["id"] if ticket else ""),
+                           RESULT_SCHEMA, lambda value: validate_result(value, [a["id"] for a in acceptance]),
+                           readonly="review" in phase)
+
+    def worker_context(self, phase, ticket):
+        return {}
+
+    def invoke(self, request, label, schema, validator, readonly=False):
+        phase = request["phase"]
         worker = self.plan["worker"]
         schema_path = self.output / "result-schema.json"
-        schema_path.write_text(json.dumps(RESULT_SCHEMA))
+        schema_path.write_text(json.dumps(schema))
         result_path = self.output / f"result-{self.sequence + 1}.json"
         if worker["kind"] == "codex":
             argv = [worker.get("executable", "codex"), "exec", "--ephemeral", "--json", "--output-schema", str(schema_path),
@@ -435,12 +472,15 @@ class Controller:
             # The owner explicitly chose this permission mode for factory workers.
             argv = [worker.get("executable", "claude"), "--print", "--dangerously-skip-permissions",
                     "--no-session-persistence", "--output-format", "json",
-                    "--json-schema", json.dumps(RESULT_SCHEMA)]
+                    "--json-schema", json.dumps(schema)]
         else:
             argv = worker["argv"]
-        record = self.execute(argv, phase + ("-" + ticket["id"] if ticket else ""),
+        if worker["kind"] != "custom":
+            for directory in self.adapter_directories():
+                argv.extend(["--add-dir", str(directory)])
+        record = self.execute(argv, label,
                               self.plan.get("worker_timeout_seconds", 900),
-                              stdin=encoded(request), readonly="review" in phase)
+                              stdin=encoded(request), readonly=readonly)
         if record["status"] != "passed":
             raise FactoryError(f"{phase} process {record['status']}; inspect preserved logs")
         if worker["kind"] == "codex":
@@ -458,7 +498,7 @@ class Controller:
                 if not isinstance(value, dict) or value.get("is_error") or value.get("permission_denials"):
                     raise FactoryError("Claude reported an error or permission denial")
                 value = value.get("structured_output")
-        value = validate_result(value, [a["id"] for a in acceptance])
+        value = validator(value)
         record["result"] = value
         self.save()
         return value
@@ -479,16 +519,17 @@ class Controller:
         state = self.report["tickets"][ticket["id"]]
         evidence, seen = [], set()
         for attempt in self.attempts():
-            before = snapshot(self.project)
+            before = self.progress()
             result = self.worker("implement" if attempt == 0 else "repair", ticket, evidence)
-            after = snapshot(self.project)
+            after = self.inputs()
+            progress = self.progress()
             entry = {"number": attempt + 1, "worker": result, "inputs_sha256": after, "checks": [], "review": None}
             state["attempts"].append(entry)
             if result["status"] == "blocked":
                 raise FactoryError(f"Ticket {ticket['id']} blocked: {result['summary']}")
-            if attempt and (after == before or after in seen):
+            if attempt and (progress == before or progress in seen):
                 raise FactoryError(f"Ticket {ticket['id']} made no source progress; stopped")
-            seen.add(after)
+            seen.add(progress)
             checks = self.run_checks(ticket["checks"])
             entry["checks"] = checks
             if not all(c["status"] == "passed" for c in checks):
@@ -509,52 +550,58 @@ class Controller:
             self.save()
         raise FactoryError(f"Ticket {ticket['id']} exhausted its bounded attempts")
 
+    def verify_integration(self):
+        required = [c for tid in self.order for c in self.tickets[tid]["checks"]]
+        self.report["integration_attempts"] = []
+        seen, evidence = set(), []
+        for attempt in self.attempts():
+            before = self.progress()
+            if attempt:
+                repair = self.worker("integration_repair", None, evidence)
+                if repair["status"] == "blocked":
+                    raise FactoryError("Integration repair blocked: " + repair["summary"])
+                after = self.progress()
+                if after == before or after in seen:
+                    raise FactoryError("Integration repair made no source progress; stopped")
+            seen.add(self.progress())
+            checks = self.run_checks(required + self.plan["integration_checks"])
+            self.report["final_checks"] = checks
+            entry = {"number": attempt + 1, "checks": checks, "review": None}
+            self.report["integration_attempts"].append(entry)
+            if any(c["status"] not in ("passed", "failed") for c in checks):
+                raise FactoryError("Final check interrupted, unavailable or changed source")
+            if not all(c["status"] == "passed" for c in checks):
+                evidence = self.failure_evidence(checks)
+                continue
+            review = self.worker("final_review", None, self.failure_evidence(checks))
+            entry["review"] = self.report["final_review"] = review
+            if self.review_complete(review):
+                break
+            if review["status"] != "changes_requested":
+                raise FactoryError("Final review blocked or acceptance remains pending")
+            evidence = [{"review": review, "checks": self.failure_evidence(checks)}]
+        else:
+            raise FactoryError("Integration exhausted its bounded attempts")
+
     def run(self):
-        lock = Path(tempfile.gettempdir()) / f"software-factory-{os.getuid()}-{digest(os.fsencode(self.project))[:24]}.lock"
+        lock = repository_lock_path(self.project)
         lock_fd = None
         try:
             try:
-                lock_fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-            except FileExistsError as exc:
-                raise FactoryError(f"Another run or stale lock exists: {lock}") from exc
+                lock_fd = os.open(lock, os.O_CREAT | os.O_RDWR, 0o600)
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                os.close(lock_fd)
+                lock_fd = None
+                raise FactoryError(f"Another run holds repository lock: {lock}") from exc
             os.write(lock_fd, encoded({"pid": os.getpid(), "report": str(self.output / 'report.json')}))
             if self.plan.get("pending_decisions"):
                 raise FactoryError("Unresolved product decisions: " + "; ".join(self.plan["pending_decisions"]))
             for tid in self.order:
                 self.run_ticket(self.tickets[tid])
-            required = [c for tid in self.order for c in self.tickets[tid]["checks"]]
-            self.report["integration_attempts"] = []
-            seen, evidence = set(), []
-            for attempt in self.attempts():
-                before = snapshot(self.project)
-                if attempt:
-                    repair = self.worker("integration_repair", None, evidence)
-                    if repair["status"] == "blocked":
-                        raise FactoryError("Integration repair blocked: " + repair["summary"])
-                    after = snapshot(self.project)
-                    if after == before or after in seen:
-                        raise FactoryError("Integration repair made no source progress; stopped")
-                seen.add(snapshot(self.project))
-                checks = self.run_checks(required + self.plan["integration_checks"])
-                self.report["final_checks"] = checks
-                entry = {"number": attempt + 1, "checks": checks, "review": None}
-                self.report["integration_attempts"].append(entry)
-                if any(c["status"] not in ("passed", "failed") for c in checks):
-                    raise FactoryError("Final check interrupted, unavailable or changed source")
-                if not all(c["status"] == "passed" for c in checks):
-                    evidence = self.failure_evidence(checks)
-                    continue
-                review = self.worker("final_review", None, self.failure_evidence(checks))
-                entry["review"] = self.report["final_review"] = review
-                if self.review_complete(review):
-                    break
-                if review["status"] != "changes_requested":
-                    raise FactoryError("Final review blocked or acceptance remains pending")
-                evidence = [{"review": review, "checks": self.failure_evidence(checks)}]
-            else:
-                raise FactoryError("Integration exhausted its bounded attempts")
+            self.verify_integration()
             self.plan_unchanged()
-            final = snapshot(self.project)
+            final = self.inputs()
             if any(c["inputs_sha256"] != final for c in self.report["final_checks"]):
                 raise FactoryError("Source changed after checks; evidence is stale")
             self.report["final_inputs_sha256"] = final
@@ -567,7 +614,7 @@ class Controller:
                     state["status"] = "incomplete" if state["attempts"] else "not_run"
             self.report["finished_at_aest"] = now()
             try:
-                final = snapshot(self.project)
+                final = self.inputs()
                 if self.report["status"] == "verified" and self.report["final_inputs_sha256"] != final:
                     self.report["status"] = "incomplete"
                     self.report["reason"] = "Source changed during finalization; evidence is stale"
@@ -578,12 +625,15 @@ class Controller:
             self.save()
             if lock_fd is not None:
                 os.close(lock_fd)
-                lock.unlink()
+                # Keep the inode stable so concurrent openers share one advisory lock.
         return self.report
 
 
 def report_status(path):
     report = read_json(path)
+    if report.get("version") == 2:
+        from factory_v2 import report_status as status_v2
+        return status_v2(path)
     fresh = (digest(Path(report["plan_path"]).read_bytes()) == report["plan_sha256"]
              and snapshot(Path(report["project"])) == report["final_inputs_sha256"])
     return {"status": report["status"] if fresh else "stale", "fresh": fresh,
@@ -593,10 +643,10 @@ def report_status(path):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    for name in ("validate", "run"):
+    for name in ("validate", "run", "investigate"):
         command = commands.add_parser(name)
         command.add_argument("plan", type=Path)
-        if name == "run":
+        if name in ("run", "investigate"):
             command.add_argument("--output-dir", type=Path, help="Empty directory outside the source worktree")
     commands.add_parser("status").add_argument("report", type=Path)
     args = parser.parse_args(argv)
@@ -611,16 +661,27 @@ def main(argv=None):
         elif args.command == "status":
             result = report_status(args.report)
         else:
-            controller = Controller(args.plan, args.output_dir)
+            selected = read_json(args.plan)
+            if not isinstance(selected, dict):
+                raise FactoryError("Plan must be an object")
+            if selected.get("version") == 2:
+                from factory_v2 import ControllerV2
+                controller = ControllerV2(args.plan, args.output_dir, investigate=args.command == "investigate")
+            elif args.command == "investigate":
+                raise FactoryError("investigate requires a version 2 audit input")
+            else:
+                controller = Controller(args.plan, args.output_dir)
             report = controller.run()
             result = {"status": report["status"], "reason": report.get("reason"),
                       "report": str(controller.output / "report.json"), "claim": report["claim"]}
         print(json.dumps(result, indent=2))
-        return 0 if result["status"] in ("valid", "verified") else 1
+        return 0 if result["status"] in ("valid", "verified", "investigated") else 1
     except (FactoryError, OSError, KeyError, ValueError) as exc:
         print(json.dumps({"status": "invalid", "reason": str(exc)}, indent=2))
         return 2
 
 
 if __name__ == "__main__":
+    # Extension modules must share this module's exception and controller types.
+    sys.modules["factory"] = sys.modules[__name__]
     raise SystemExit(main())

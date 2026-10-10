@@ -1,80 +1,54 @@
 # Software Factory
 
-**Tell Codex or Claude Code what you want to build:**
+Give Codex or Claude Code either input:
 
 > Use the software factory to build [desired product outcome].
 
-You choose the product behaviour. The agent handles routine engineering, checks the result, and repairs review findings.
+> Use the software factory to investigate and improve [audit points and sources].
 
-![Factory loop: make a change, run checks, get a fresh review, and repair findings until the result is clear. Repeat after integration.](docs/factory-loop.svg)
+You choose product behaviour, one material decision at a time. The agent uses the installed `ask-matt` router for existing skills, records your decisions, and prepares tasks. Investigation findings never approve a change. This repository keeps no second Matt skill catalogue.
 
-[Edit the diagram in Excalidraw](docs/factory-loop.excalidraw).
+Small changes stay in the current session. For substantial work, the on-demand Python runner enforces checks and fresh review. Version 1 keeps its sequential checkout workflow. Version 2 investigates audits in fresh read-only processes and builds stable parallel batches in isolated Git worktrees. Dependencies become ready after all participating repositories are integrated.
 
-## Start here
+![The shared build loop: change, checks, fresh review, repair, and final integrated checks. Intake and v2 scheduling are described in the runner guide.](docs/factory-loop.svg)
 
-1. **Install the tools.** Use macOS or Linux, Python 3.10+, Git, and an authenticated Codex or Claude Code CLI. Install [Matt Pocock’s skills](https://github.com/mattpocock/skills), including `ask-matt`. That skill selects the right workflow; this repository keeps no second catalogue.
-2. **Install this skill.** Clone it to a stable location and link it to your client:
+The [editable diagram](docs/factory-loop.excalidraw) shows the shared **build loop**, after intake and scheduling.
 
-   ```sh
-   git clone git@github.com:EdwinMurari/software-factory.git
-   cd software-factory
-   mkdir -p ~/.codex/skills ~/.claude/skills
-   ln -s "$PWD" ~/.codex/skills/software-factory
-   ln -s "$PWD" ~/.claude/skills/software-factory
-   ```
+## Install
 
-   Use only the link for the client you need. If a destination already exists, inspect it before replacing it. Reload the client or start a new session.
-
-3. **Open your project and use the prompt above.** The agent clarifies material product choices with you. Small changes stay in the current session. Substantial work uses the runner. The runner needs a Git worktree with an initial commit.
-
-## What makes the loop deterministic?
-
-The **skill** guides decisions. The **Python runner** enforces task order, check commands, review gates, and stop conditions. It does not force every normal chat through the runner.
-
-For each task, the runner repeats **change → checks → fresh review → repair**. It checks and reviews the combined result after integration, too.
-
-A run is **verified** only when checks pass, every acceptance criterion has evidence, and the review reports no remaining issues. There is no default attempt-count cap. A configured cap, time limit, blocker, or repair with no source progress leaves the run **incomplete**.
-
-Each built-in review starts a new CLI session. It receives requirements, current code, the starting baseline, and check evidence. It receives no implementation conversation or earlier review conclusions. Fresh context reduces carry-over bias; it cannot guarantee a complete or unbiased review.
-
-The control flow is deterministic. Model output is not. Passing checks do not prove bug freedom.
-
-## Run it directly
-
-**Claude workers bypass permission prompts** with `--dangerously-skip-permissions`. This was the explicit choice for the original installation. The runner is not a sandbox. Codex uses its configured permissions.
-
-1. Prepare a plan from the [runner guide](references/runner.md). Use the target project's requirements and check commands.
-2. Validate and run it from this repository:
-
-   ```sh
-   python3 scripts/factory.py validate /absolute/path/plan.json
-   python3 scripts/factory.py run /absolute/path/plan.json
-   ```
-
-3. Read the report at the path printed by the runner. To check its status later:
-
-   ```sh
-   python3 scripts/factory.py status /absolute/path/report.json
-   ```
-
-Failed runs preserve edits and logs. The runner does not commit, push, or deploy your project.
-
-<details>
-<summary><strong>Maintain or extend the factory</strong></summary>
-
-Run the controller tests after changing its code:
+Use macOS or Linux, Python 3.10+, Git, and an authenticated Codex or Claude Code CLI. Install [Matt Pocock’s skills](https://github.com/mattpocock/skills), including `ask-matt`, separately. Clone this repository to a stable path and link the skill for your client:
 
 ```sh
-python3 -m unittest discover -s scripts -p test_factory.py
+git clone git@github.com:EdwinMurari/software-factory.git
+cd software-factory
+mkdir -p ~/.codex/skills ~/.claude/skills
+ln -s "$PWD" ~/.codex/skills/software-factory
+ln -s "$PWD" ~/.claude/skills/software-factory
 ```
 
-These tests use disposable Git repositories and fake workers. They check controller behaviour without model calls. They do not measure live model quality.
+Inspect an existing destination before replacing it. Start a new client session after installation. This repository was exported from Berry’s skill catalogue at commit `93171ff`. Catalogue links and this checkout do not sync automatically.
 
-- [Skill](SKILL.md): product acceptance and workflow.
-- [Runner guide](references/runner.md): plan format, adapters, limits, and evidence.
-- [Source lessons](references/sources.md): findings from the articles and videos, with attribution and limits.
-- [Quality](references/quality.md) and [performance](references/performance.md): checks suited to the change.
+## Run
 
-This repository was exported from the Berry skill catalogue at commit `93171ff`. Existing Berry installations still use their catalogue links. The two repositories do not sync automatically.
+Follow the [v1 guide](references/runner.md) or [v2 guide and runnable examples](references/isolated-runner.md). Plans contain trusted executable commands. Claude workers use the owner-approved `--dangerously-skip-permissions`; Codex keeps its configured policy. The runner detects source mutations and stale evidence but is not a security sandbox.
 
-</details>
+```sh
+python3 scripts/factory.py validate /absolute/path/build.json
+python3 scripts/factory.py investigate /absolute/path/audit.json
+python3 scripts/factory.py run /absolute/path/build.json
+python3 scripts/factory.py status /absolute/path/report.json
+```
+
+Success requires green checks, every acceptance criterion verified, and zero review issues on the final exact source state. There is no default attempt cap. Time limits, no progress, cancellation, blockers, and stale evidence leave work incomplete. Explicit audit deferrals remain listed separately.
+
+V2 creates local commits and integration branches. It preserves the starting checkout and all failure worktrees. The controller owns commits and merges; a worker changing Git HEAD invalidates its result. The runner does not push, deploy, or close issues. Reports are evidence records, not proof of human identity or bug freedom.
+
+## Maintain
+
+```sh
+python3 -m unittest discover -s scripts -p 'test*.py'
+```
+
+Tests use disposable Git repositories and fake workers. They check scheduling, integration, freshness, and failure handling; they do not measure model quality.
+
+Read [SKILL.md](SKILL.md) for the workflow, [quality](references/quality.md) and [performance](references/performance.md) for check selection, and [sources](references/sources.md) for attributed lessons and limits.

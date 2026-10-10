@@ -42,3 +42,11 @@ Reuse an existing spec and issue tracker when present. A new tracker or mandator
 Choose tasks that cross enough of the application to prove one useful behaviour. Avoid splitting into “all models”, “all APIs”, and “all UI” when none provides feedback alone. Keep tasks small enough for a fresh worker to implement and verify. Review the combined user journey at the end.
 
 The runner plan is an execution input, not proof that a human approved a product decision. Preserve the actual decision in the chat/spec and flag unresolved choices explicitly.
+
+## Audit intake
+
+Keep every supplied point with its source references. Group only with an explicit reason, then investigate each point or group in a fresh read-only worker. Record evidence and a confirmed, disproved or blocked disposition. Working changes are part of investigation freshness.
+
+Use the installed `ask-matt` router for the next workflow; read the selected skill. Ask about each material product question separately. Preserve the actual user response in a referenced file, with a content hash. A resolved flag or investigation recommendation without that record cannot open the build gate. Records are traceable evidence, not identity authentication.
+
+Map each point to approved tasks, a disproved finding, a blocker, or a user-approved deferral. Attach required decision IDs to the dependent tasks. Keep deferrals distinct from implemented work. If sources, points, evidence or decision records change, investigate or agree again where needed before building. See [v2 execution](isolated-runner.md) for the deterministic gates.

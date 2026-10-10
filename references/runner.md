@@ -1,4 +1,6 @@
-# On-demand ticket runner
+# Version 1: sequential on-demand runner
+
+Version 1 remains supported. For fresh audit investigations, bounded parallel worktrees and linked repositories, use [version 2](isolated-runner.md). Both versions share the worker/check/repair/review engine.
 
 The [controller](../scripts/factory.py) is a Python 3.10+ command for macOS and Linux. It needs Git, a worktree with an initial commit, and an installed/authenticated Codex or Claude Code CLI. It supports any project language through argument-array check commands. Git submodules and native Windows process management are outside this version.
 
@@ -107,7 +109,7 @@ This adapter boundary is the path to Berry LLM Gateway. Before implementing that
 Run the [regression tests](../scripts/test_factory.py) after changing the controller:
 
 ```sh
-python3 -m unittest discover -s scripts -p test_factory.py
+python3 -m unittest discover -s scripts -p 'test*.py'
 ```
 
 They use disposable Git repositories and fake workers. They cover control flow and failure handling, not live model quality. After changing a built-in adapter, also run a bounded smoke check with that actual installed CLI and preserve its report.

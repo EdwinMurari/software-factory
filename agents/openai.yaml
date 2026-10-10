@@ -1,0 +1,4 @@
+interface:
+  display_name: "Software Factory"
+  short_description: "Build product intent into checked, maintainable code"
+  default_prompt: "Use $software-factory to turn my product request into a working change with evidence."

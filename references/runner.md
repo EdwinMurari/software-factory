@@ -1,3 +1,5 @@
+> Legacy v1 compatibility reference. New explicit factory requests use the [v2 lifecycle](isolated-runner.md).
+
 # Version 1: sequential on-demand runner
 
 Version 1 remains supported. For fresh audit investigations, bounded parallel worktrees and linked repositories, use [version 2](isolated-runner.md). Both versions share the worker/check/repair/review engine.

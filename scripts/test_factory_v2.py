@@ -283,13 +283,13 @@ class IsolatedTests(unittest.TestCase):
         with self.assertRaisesRegex(factory.FactoryError,'questions lack'):
             factory_v2.load_plan(self.plan_path)
         self.plan = copy.deepcopy(original)
+        _,r = self.run_factory(output='approved')
+        self.assertEqual(r['status'],'verified',r.get('reason'))
         self.plan['decisions'][0] = {'id':'choice-p','status':'pending'}
         _,r = self.run_factory(output='pending')
         self.assertEqual(r['status'],'incomplete')
         self.assertIn('Unresolved product decision',r['reason'])
         self.plan = original
-        _,r = self.run_factory(output='approved')
-        self.assertEqual(r['status'],'verified',r.get('reason'))
         (self.repo/'new-source.txt').write_text('stale')
         self.plan_path.write_text(json.dumps(self.plan))
         with self.assertRaisesRegex(factory.FactoryError,'fingerprint is stale'):
@@ -455,8 +455,8 @@ class IsolatedTests(unittest.TestCase):
                 self.assert_stopped(int((self.base/(tid+'.child')).read_text()))
             # Advisory locks are released while retained lock files prevent unlink races.
             self.config()
-            self.plan['tickets']=[self.ticket('a')]
-            _,r=self.run_factory(output='after-cancel')
+            from factory_lifecycle import operate
+            r = operate(output / 'report.json', 'continue')
             self.assertEqual(r['status'],'verified',r.get('reason'))
         finally:
             if proc.poll() is None: proc.kill();proc.wait()

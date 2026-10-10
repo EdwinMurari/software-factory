@@ -569,9 +569,13 @@ class Controller:
         previous = self.report["integration_attempts"][-1] if self.report["integration_attempts"] else None
         if previous:
             checks, review = previous.get("checks", []), previous.get("review")
-            if review and review["status"] == "changes_requested":
+            # Retained repairs or adopted edits need new validation. Only require
+            # another source mutation when the failure describes today's inputs.
+            current = self.inputs()
+            same_inputs = checks and all(c.get("inputs_sha256") == current for c in checks)
+            if same_inputs and review and review["status"] == "changes_requested":
                 evidence = [{"review": review, "checks": self.failure_evidence(checks)}]
-            elif any(c["status"] == "failed" for c in checks):
+            elif same_inputs and any(c["status"] == "failed" for c in checks):
                 evidence = self.failure_evidence(checks)
         for attempt in self.attempts():
             before = self.progress()

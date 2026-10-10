@@ -222,6 +222,59 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual(len(json.loads(final_path.read_text())['integration_attempts']), 2)
         self.assertEqual(self.cli('complete', self.report)[0], 0)
 
+    def test_adopted_fix_rechecks_previous_integration_failure(self):
+        self.f.plan['max_attempts'] = 1
+        self.f.plan['checks'].append({'id': 'final-only', 'repo': 'app', 'argv':
+            [sys.executable, '-c', "from pathlib import Path; assert Path('fix.txt').exists()"]})
+        self.f.plan['integration_checks'] = ['final-only']
+        self.f.plan_path.write_text(json.dumps(self.f.plan))
+        self.f.config(no_progress=True)
+        self.register()
+        self.assertNotEqual(self.cli('continue', self.report)[0], 0)
+        before = json.loads(self.report.read_text())
+        final_path = self.output / 'final' / 'report.json'
+        failed = json.loads(final_path.read_text())
+        self.assertEqual(failed['integration_attempts'][-1]['checks'][-1]['status'], 'failed')
+        # The same failing state still needs a real repair, even across restart.
+        for _ in range(2):
+            code, result = self.cli('continue', self.report)
+            self.assertNotEqual(code, 0)
+            self.assertIn('Integration repair made no source progress', result['reason'])
+        target = Path(before['repositories']['app']['worktree']) / 'fix.txt'
+        target.write_text('approved fix')
+        code, result = self.cli('adopt', self.report, '--reason', 'Retain the approved integration fix')
+        self.assertEqual(code, 0, result)
+        self.assertEqual(target.read_text(), 'approved fix')
+        final = json.loads(final_path.read_text())
+        self.assertEqual(len(final['integration_attempts']), 2)
+        self.assertTrue(all(c['status'] == 'passed' for c in final['final_checks']))
+        self.assertNotEqual(final['final_checks'][-1]['inputs_sha256'],
+                            failed['integration_attempts'][-1]['checks'][-1]['inputs_sha256'])
+        self.assertEqual(final['final_review']['status'], 'complete')
+        self.assertEqual(json.loads(self.report.read_text())['run_id'], before['run_id'])
+        self.assertEqual(self.cli('complete', self.report)[0], 0)
+
+    def test_integration_repair_interrupted_before_checks_revalidates_retained_fix(self):
+        self.f.plan['max_attempts'] = 1
+        self.f.plan['checks'].append({'id': 'final-only', 'repo': 'app', 'argv':
+            [sys.executable, '-c', "from pathlib import Path; assert Path('fix.txt').exists()"]})
+        self.f.plan['integration_checks'] = ['final-only']
+        self.f.plan_path.write_text(json.dumps(self.f.plan))
+        self.register()
+        self.assertNotEqual(self.cli('continue', self.report)[0], 0)
+        owner = factory_v2.ControllerV2(self.f.plan_path, self.output, resume=True)
+        with patch.object(factory_v2.Session, 'run_checks', side_effect=OSError('Interrupted before checks')):
+            result = owner.run()
+        self.assertIn('Interrupted before checks', result['reason'])
+        target = Path(result['repositories']['app']['worktree']) / 'fix.txt'
+        self.assertEqual(target.read_text(), 'x')
+        self.f.config(no_progress=True)
+        code, result = self.cli('continue', self.report)
+        self.assertEqual(code, 0, result)
+        self.assertEqual(target.read_text(), 'x')
+        self.assertEqual(len([c for c in self.f.calls() if c['phase'] == 'integration_repair']), 1)
+        self.assertEqual(self.cli('complete', self.report)[0], 0)
+
     def test_failed_adoption_commit_resumes_without_losing_evidence(self):
         value = self.build()
         root = Path(value['repositories']['app']['worktree'])

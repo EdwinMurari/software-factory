@@ -368,9 +368,12 @@ class IsolatedTests(unittest.TestCase):
         c = factory_v2.ControllerV2(self.plan_path, self.base / 'output')
         original = factory_v2.repository_inputs
         changed = False
+        verified_evidence = {}
         def concurrent_change(repositories):
             nonlocal changed
             if c.report['status'] == 'verified' and repositories == c.integration and not changed:
+                verified_evidence.update({key: copy.deepcopy(c.report[key])
+                                          for key in ('final_inputs', 'final_checks', 'final_review')})
                 (next(iter(repositories.values())) / 'late-change.txt').write_text('changed after verification')
                 changed = True
             return original(repositories)
@@ -378,9 +381,17 @@ class IsolatedTests(unittest.TestCase):
             r = c.run()
         self.assertTrue(changed)
         self.assertEqual(r['status'], 'incomplete')
-        self.assertIn('finalization', r['reason'])
+        self.assertIn('adopt', r['reason'])
+        for key, value in verified_evidence.items():
+            self.assertEqual(r[key], value, key)
+        self.assertEqual((next(iter(c.integration.values())) / 'late-change.txt').read_text(),
+                         'changed after verification')
         self.assertNotEqual(r['final_inputs'], original(c.integration))
-        self.assertEqual(factory.report_status(c.output / 'report.json')['status'], 'incomplete')
+        report_path = c.output / 'report.json'
+        self.assertEqual(json.loads(report_path.read_text())['status'], 'incomplete')
+        status = factory.report_status(report_path)
+        self.assertEqual(status['status'], 'stale')
+        self.assertFalse(status['fresh'])
 
     def test_worktree_from_same_repository_cannot_bypass_another_run_lock(self):
         linked = self.base / 'linked'

@@ -119,7 +119,7 @@ def repository_lock_path(project):
     return Path(tempfile.gettempdir()) / f"software-factory-{os.getuid()}-{digest(os.fsencode(directory))[:24]}.lock"
 
 
-def snapshot(project):
+def snapshot(project, content_only=False):
     """Hash index entries, HEAD and all tracked/nonignored worktree inputs.
 
     Ignored and external inputs are deliberately outside this contract. Symlink
@@ -146,7 +146,7 @@ def snapshot(project):
             records.append([os.fsdecode(raw), "deleted"])
         except OSError as exc:
             raise FactoryError(f"Cannot fingerprint {path}: {exc}") from exc
-    return digest(encoded({"head": head.decode().strip(), "index": digest(index), "files": records}))
+    return digest(encoded(records if content_only else {"head": head.decode().strip(), "index": digest(index), "files": records}))
 
 
 def load_plan(path):
@@ -493,6 +493,16 @@ class Controller:
             ),
         }
         request.update(self.worker_context(phase, ticket))
+        if self.plan.get("input", {}).get("kind") == "review" and "review" in phase:
+            request["instructions"] += (
+                " This is a review of existing work. Inspect the whole scoped change from the explicit comparison "
+                "baseline, including committed and working changes that predate this run; these are review inputs.")
+            if self.plan["input"].get("review_only", False):
+                request["instructions"] += (
+                    " Report-only inspection permits findings and pending product criteria. Use changes_requested "
+                    "for concrete defects. A missing product spec is an explicit limitation: mark affected criteria "
+                    "pending and report the available code findings; do not invent approval or block solely for this "
+                    "missing spec. Other actual blockers still require blocked. Do not repair or commit source.")
         return self.invoke(request, phase + ("-" + ticket["id"] if ticket else ""),
                            RESULT_SCHEMA, lambda value: validate_result(value, [a["id"] for a in acceptance]),
                            readonly="review" in phase)
@@ -699,6 +709,8 @@ class Controller:
         raise FactoryError(f"Ticket {ticket['id']} exhausted its bounded attempts")
 
     def verify_integration(self, findings=None):
+        if self.report.get("integration_validation_stop"):
+            raise FactoryError(self.report["integration_validation_stop"])
         required = [c for tid in self.order for c in self.tickets[tid]["checks"]]
         self.report.setdefault("integration_attempts", [])
         seen = set(self.report.get("integration_progress_inputs", []))
@@ -729,13 +741,24 @@ class Controller:
                 evidence += [{"review": review, "checks": self.failure_evidence(checks)}]
             elif same_inputs and any(c["status"] == "failed" for c in checks):
                 evidence += self.failure_evidence(checks)
+        review_only = self.plan.get("input", {}).get("review_only", False)
+        if review_only:
+            evidence = []
+        if review_only and self.report.get("pending_source_worker"):
+            raise FactoryError("Review-only cannot resume a source worker")
         for attempt in self.attempts():
             before = self.progress()
             pending = self.report.get("pending_source_worker")
             if attempt or evidence or (pending and pending["label"] == "integration_repair"):
+                if review_only:
+                    raise FactoryError("Review-only cannot dispatch repair")
                 repair, before = self.source_worker("integration_repair", None, evidence)
                 if repair["status"] == "blocked":
-                    raise FactoryError("Integration repair blocked: " + repair["summary"])
+                    message = "Integration repair blocked: " + repair["summary"]
+                    if self.plan.get("input", {}).get("kind") == "review":
+                        self.report["integration_validation_stop"] = message
+                        self.save()
+                    raise FactoryError(message)
                 after = self.progress()
                 if after == before or after in seen:
                     self.report["integration_no_progress_stop"] = {"progress": after}
@@ -754,17 +777,33 @@ class Controller:
             entry["checks"] = self.report["final_checks"] = checks
             self.save()
             if any(c["status"] not in ("passed", "failed") for c in checks):
-                raise FactoryError("Final check interrupted, unavailable or changed source")
-            if not all(c["status"] == "passed" for c in checks):
+                message = "Final check interrupted, unavailable or changed source; retained evidence is incomplete"
+                if self.plan.get("input", {}).get("kind") == "review":
+                    self.report["integration_validation_stop"] = message
+                    self.save()
+                raise FactoryError(message)
+            if not all(c["status"] == "passed" for c in checks) and not review_only:
                 evidence = self.failure_evidence(checks)
                 continue
-            review = self.worker("final_review", None, self.failure_evidence(checks))
+            try:
+                review = self.worker("final_review", None, self.failure_evidence(checks))
+            except FactoryError as exc:
+                if self.plan.get("input", {}).get("kind") == "review":
+                    self.report["integration_validation_stop"] = str(exc)
+                    self.save()
+                raise
             entry["review"] = self.report["final_review"] = review
             self.save()
+            if review_only and review["status"] != "blocked":
+                break
             if self.review_complete(review):
                 break
             if review["status"] != "changes_requested":
-                raise FactoryError("Final review blocked or acceptance remains pending")
+                message = "Final review blocked or acceptance remains pending"
+                if self.plan.get("input", {}).get("kind") == "review":
+                    self.report["integration_validation_stop"] = message
+                    self.save()
+                raise FactoryError(message)
             evidence = [{"review": review, "checks": self.failure_evidence(checks)}]
         else:
             raise FactoryError("Integration exhausted its bounded attempts")
@@ -874,8 +913,11 @@ def main(argv=None):
             report = controller.run(action="register") if args.command == "register" else controller.run()
             result = {"status": report["status"], "reason": report.get("reason"),
                       "report": str(controller.output / "report.json"), "claim": report["claim"]}
+            if report["status"] == "reviewed":
+                from factory_lifecycle import complete
+                result.update(complete(controller.output / "report.json"))
         print(json.dumps(result, indent=2))
-        return 0 if result["status"] in ("valid", "verified", "investigated", "registered", "closed") else 1
+        return 0 if result["status"] in ("valid", "verified", "investigated", "registered", "reviewed", "closed") else 1
     except (FactoryError, OSError, KeyError, ValueError) as exc:
         print(json.dumps({"status": "invalid", "reason": str(exc)}, indent=2))
         return 2

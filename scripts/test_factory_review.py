@@ -1,0 +1,189 @@
+"""Review-entry CLI journeys against real dirty Git worktrees."""
+import json
+import os
+from pathlib import Path
+import unittest
+from unittest.mock import patch
+import factory_v2
+
+import test_factory_lifecycle as lifecycle
+import factory
+
+
+class ReviewTests(unittest.TestCase):
+    cli = lifecycle.LifecycleTests.cli
+    register = lifecycle.LifecycleTests.register
+    def setUp(self):
+        lifecycle.LifecycleTests.setUp(self)
+        self.baseline = self.f.git(self.f.repo, 'rev-parse', 'HEAD').decode().strip()
+        self.f.plan['input'] = {'kind': 'review', 'baselines': {'app': self.baseline}}
+        self.f.plan_path.write_text(json.dumps(self.f.plan))
+
+    def configure(self, **values):
+        self.f.control.write_text(json.dumps(values))
+
+    def review(self, only=False):
+        if only:
+            self.f.plan['input']['review_only'] = True
+            self.f.plan_path.write_text(json.dumps(self.f.plan))
+        self.register()
+        code, value = self.cli('continue', self.report)
+        return code, value, json.loads(self.report.read_text())
+
+    def test_dirty_committed_staged_untracked_modes_are_preserved(self):
+        repo = self.f.repo
+        (repo / 'committed.txt').write_text('committed change')
+        self.f.git(repo, 'add', '.')
+        self.f.git(repo, 'commit', '-qm', 'existing work')
+        (repo / 'existing.txt').write_text('staged\n')
+        self.f.git(repo, 'add', '.')
+        (repo / 'existing.txt').write_text('unstaged\n')
+        (repo / 'executable').write_text('run')
+        (repo / 'executable').chmod(0o751)
+        (repo / 'link').symlink_to('existing.txt')
+        before = factory.snapshot(repo)
+        code, value, report = self.review()
+        self.assertEqual(code, 0, value)
+        self.assertEqual(factory.snapshot(repo), before)
+        copy = Path(report['repositories']['app']['worktree'])
+        self.assertEqual((copy / 'existing.txt').read_text(), 'unstaged\n')
+        self.assertEqual(self.f.git(copy, 'show', ':existing.txt'), b'staged\n')
+        self.assertEqual((copy / 'executable').stat().st_mode & 0o777, 0o751)
+        self.assertEqual(os.readlink(copy / 'link'), 'existing.txt')
+        calls = self.f.calls()
+        self.assertEqual([c['phase'] for c in calls], ['final_review'])
+        baseline = calls[0]['request']['baseline']['app']
+        self.assertEqual(baseline['head'], self.baseline)
+        self.assertEqual(Path(baseline['tracked_patch']).read_bytes(), b'')
+        self.assertEqual(self.cli('complete', self.report)[0], 0)
+
+    def test_findings_repair_then_fresh_review(self):
+        self.configure(findings=True)
+        code, value, report = self.review()
+        self.assertEqual(code, 0, value)
+        calls = self.f.calls()
+        self.assertEqual([c['phase'] for c in calls], ['final_review', 'integration_repair', 'final_review'])
+        self.assertNotEqual(calls[0]['pid'], calls[-1]['pid'])
+        self.assertNotIn('Missing fix.txt', json.dumps(calls[-1]['request']['evidence']))
+        self.assertTrue((Path(report['repositories']['app']['worktree']) / 'fix.txt').exists())
+        self.assertFalse((self.f.repo / 'fix.txt').exists())
+        self.assertEqual(self.cli('complete', self.report)[0], 0)
+
+    def test_report_only_findings_and_stale_evidence(self):
+        self.configure(findings=True)
+        before = factory.snapshot(self.f.repo)
+        code, value, report = self.review(only=True)
+        self.assertEqual(code, 0, value)
+        self.assertEqual(value['status'], 'reviewed')
+        self.assertEqual(report['final_review']['issues'], ['Missing fix.txt'])
+        self.assertEqual(factory.snapshot(self.f.repo), before)
+        self.assertEqual([c['phase'] for c in self.f.calls()], ['final_review'])
+        self.assertEqual(self.cli('complete', self.report)[1]['status'], 'reviewed')
+        self.assertEqual(self.cli('continue', self.report)[1]['status'], 'reviewed')
+        self.assertTrue(all(c['phase'] == 'final_review' for c in self.f.calls()))
+        Path(report['final_checks'][0]['stdout']).write_text('changed evidence')
+        self.assertNotEqual(self.cli('complete', self.report)[0], 0)
+        self.assertEqual(self.cli('status', self.report)[1]['status'], 'stale')
+
+    def test_report_only_mutating_check_never_edits_source(self):
+        self.f.plan['checks'][0]['argv'][-1] = "from pathlib import Path; Path('existing.txt').write_text('bad')"
+        self.f.plan_path.write_text(json.dumps(self.f.plan))
+        before = factory.snapshot(self.f.repo)
+        code, value, report = self.review(only=True)
+        self.assertNotEqual(code, 0, value)
+        self.assertEqual(factory.snapshot(self.f.repo), before)
+        self.assertEqual(report['final_checks'][0]['status'], 'source_changed')
+        self.assertEqual(self.f.calls(), [])
+        self.assertNotEqual(self.cli('continue', self.report)[0], 0)
+
+    def test_no_progress_cannot_retry_to_pass(self):
+        (self.f.repo / 'dirty.txt').write_text('existing dirt')
+        self.configure(findings=True, no_progress=True)
+        code, value, report = self.review()
+        self.assertNotEqual(code, 0, value)
+        self.assertIn('no source progress', value['reason'])
+        calls = len(self.f.calls())
+        self.assertNotEqual(self.cli('continue', self.report)[0], 0)
+        self.assertEqual(len(self.f.calls()), calls)
+
+    def test_report_only_failed_checks_are_reported_and_never_repaired(self):
+        self.f.plan['checks'][0]['argv'][-1] = "raise SystemExit(7)"
+        self.f.plan_path.write_text(json.dumps(self.f.plan))
+        code, value, report = self.review(only=True)
+        self.assertEqual(code, 0, value)
+        completion = self.cli('complete', self.report)[1]
+        self.assertEqual(completion['status'], 'reviewed')
+        self.assertFalse(completion['verified'])
+        self.assertEqual(completion['check_failures'], ['contents'])
+        self.assertEqual([c['phase'] for c in self.f.calls()], ['final_review'])
+
+    def test_report_only_reviewer_mutation_is_durably_incomplete(self):
+        self.configure(mutate_review=True)
+        before = factory.snapshot(self.f.repo)
+        code, value, report = self.review(only=True)
+        self.assertNotEqual(code, 0)
+        self.assertEqual(factory.snapshot(self.f.repo), before)
+        calls = len(self.f.calls())
+        self.assertNotEqual(self.cli('continue', self.report)[0], 0)
+        self.assertEqual(len(self.f.calls()), calls)
+        self.assertNotEqual(self.cli('adopt', self.report, '--reason', 'keep mutation')[0], 0)
+        self.assertNotEqual(self.cli('complete', self.report)[0], 0)
+
+    def test_missing_spec_is_explicit_report_only_limitation(self):
+        self.f.plan['spec'] = None
+        self.f.plan['tickets'][0]['source'] = None
+        self.f.plan_path.write_text(json.dumps(self.f.plan))
+        self.assertNotEqual(self.cli('validate', self.f.plan_path)[0], 0)
+        code, value, report = self.review(only=True)
+        self.assertEqual(code, 0, value)
+        self.assertTrue(self.cli('complete', self.report)[1]['limitations'])
+        self.assertTrue(self.f.calls()[0]['request']['limitations'])
+
+    def test_baseline_requires_full_pinned_commit(self):
+        self.f.plan['input']['baselines']['app'] = 'HEAD'
+        self.f.plan_path.write_text(json.dumps(self.f.plan))
+        self.assertNotEqual(self.cli('register', self.f.plan_path, '--output-dir', self.output)[0], 0)
+        self.assertEqual(self.f.calls(), [])
+
+    def test_source_change_and_active_claim_reject_new_or_continued_run(self):
+        self.register()
+        self.assertNotEqual(self.cli('run', self.f.plan_path, '--output-dir', self.f.base / 'bypass')[0], 0)
+        (self.f.repo / 'new.txt').write_text('late source edit')
+        self.assertNotEqual(self.cli('continue', self.report)[0], 0)
+        self.assertEqual(self.f.calls(), [])
+        self.assertEqual(self.cli('status', self.report)[1]['status'], 'stale')
+        self.assertEqual(self.cli('close', self.report, '--reason', 'replace agreement')[0], 0)
+
+    def test_product_blocker_cannot_disappear_on_lucky_retry(self):
+        self.configure(pending=True)
+        code, value, report = self.review()
+        self.assertNotEqual(code, 0)
+        calls = len(self.f.calls())
+        self.configure()
+        self.assertNotEqual(self.cli('continue', self.report)[0], 0)
+        self.assertEqual(len(self.f.calls()), calls)
+
+    def test_interrupted_dirty_seed_continues_same_run(self):
+        (self.f.repo / 'dirty.txt').write_text('keep existing edits')
+        self.register()
+        owner = factory_v2.ControllerV2(self.f.plan_path, self.output, resume=True)
+        copy = factory_v2.shutil.copy2
+        def interrupt_copy(source, target):
+            copy(source, target)
+            raise OSError('copy interrupted')
+        with patch.object(factory_v2.shutil, 'copy2', side_effect=interrupt_copy):
+            value = owner.run()
+        self.assertEqual(value['status'], 'incomplete')
+        self.assertEqual(self.f.calls(), [])
+        code, result = self.cli('continue', self.report)
+        self.assertEqual(code, 0, result)
+        self.assertEqual(json.loads(self.report.read_text())['run_id'], owner.run_id)
+        self.assertEqual(self.cli('complete', self.report)[0], 0)
+
+    def test_tampered_attempt_summary_is_stale(self):
+        code, value, report = self.review(only=True)
+        self.assertEqual(code, 0, value)
+        report['integration_attempts'][0]['review']['summary'] = 'tampered summary'
+        self.report.write_text(json.dumps(report))
+        self.assertNotEqual(self.cli('complete', self.report)[0], 0)
+        self.assertEqual(self.cli('status', self.report)[1]['status'], 'stale')

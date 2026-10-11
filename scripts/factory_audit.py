@@ -134,6 +134,8 @@ def execution_intake(plan, base, sources, tickets, dependencies):
     blocked.extend(plan.get("pending_decisions", []))
     gates = {"blockers": blocked, "global_blockers": plan.get("pending_decisions", []),
              "task_blockers": task_blockers}
+    if value["kind"] == "review":
+        return {"kind": "review", "decisions": list(decisions.values()), **gates}
     if value["kind"] == "outcome":
         keys(value, ["kind", "description"])
         text(value["description"], "desired outcome")

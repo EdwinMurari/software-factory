@@ -7,6 +7,8 @@ import json
 import os
 from pathlib import Path
 import signal
+import shutil
+import subprocess
 import tempfile
 import threading
 import time
@@ -106,17 +108,37 @@ def load_plan(path, investigate=False):
                                 for name, root in repositories.items()}
     if not isinstance(plan["input"], dict):
         raise FactoryError("input must be an object")
+    reviewing = plan["input"].get("kind") == "review"
+    if reviewing:
+        if investigate:
+            raise FactoryError("Review input uses register/continue, not investigate")
+        value = plan["input"]
+        keys(value, ["kind", "baselines"], ["review_only"])
+        if type(value.get("review_only", False)) is not bool:
+            raise FactoryError("review_only must be boolean")
+        if not isinstance(value["baselines"], dict) or set(value["baselines"]) != repositories.keys():
+            raise FactoryError("Review needs an explicit baseline for every repository")
+        for name, baseline in value["baselines"].items():
+            if not isinstance(baseline, str) or len(baseline) != 40 or any(c not in "0123456789abcdef" for c in baseline):
+                raise FactoryError("Review baselines must be pinned full commit SHAs")
+            if os.fsdecode(git(repositories[name], "rev-parse", "--verify", baseline + "^{commit}")).strip() != baseline:
+                raise FactoryError("Review baseline must identify a commit")
     dependencies = []
     if investigate:
         points, groups = audit_input(plan["input"], path.parent, dependencies)
         plan["_audit"] = {"points": points, "groups": groups}
     else:
-        plan["spec"] = reference(plan["spec"], path.parent)
-        dependencies.append(plan["spec"])
+        if reviewing and plan["spec"] is None:
+            if not plan["input"].get("review_only", False):
+                raise FactoryError("Review-and-repair needs a referenced product agreement; review_only permits missing spec")
+        else:
+            plan["spec"] = reference(plan["spec"], path.parent)
+            dependencies.append(plan["spec"])
         check_map = {c["id"]: c for c in plan["checks"]}
         for ticket in plan["tickets"]:
-            ticket["source"] = reference(ticket["source"], path.parent)
-            dependencies.append(ticket["source"])
+            if not (reviewing and plan["spec"] is None and ticket["source"] is None):
+                ticket["source"] = reference(ticket["source"], path.parent)
+                dependencies.append(ticket["source"])
             if any(check_map[cid]["repo"] not in ticket["repos"] for cid in ticket["checks"]):
                 raise FactoryError("Task checks must target participating repositories")
         # Every repository's commands must be included in the final exact-state check set.
@@ -186,6 +208,8 @@ class Session(Controller):
 
     def progress(self):
         # Commits change HEAD even when a repair cycles back to earlier content.
+        if self.owner.reviewing:
+            return digest(encoded({name: snapshot(path, content_only=True) for name, path in sorted(self.repositories.items())}))
         return digest(encoded({name: os.fsdecode(git(path, "rev-parse", "HEAD^{tree}")).strip()
                                for name, path in sorted(self.repositories.items())}))
 
@@ -221,13 +245,15 @@ class Session(Controller):
                                        readonly=True, cwd=self.repositories[check["repo"]]),
                           check_id=cid, repo=check["repo"], reused=False)
             results.append(result)
-            if result["status"] != "passed":
+            if result["status"] != "passed" and not (self.owner.review_only and result["status"] == "failed"):
                 break
         return results
 
     def worker_context(self, phase, ticket):
         return {"repositories": {name: str(path) for name, path in self.repositories.items()},
                 "spec": self.plan.get("spec"), "decisions": self.plan.get("decisions", []),
+                "review_input": self.plan.get("input") if self.owner.reviewing else None,
+                "limitations": ["No product spec supplied; product compliance is unverified."] if self.owner.reviewing and self.plan.get("spec") is None else [],
                 "intake": self.plan.get("_intake"),
                 "integration_heads": {name: os.fsdecode(git(path, "rev-parse", "HEAD")).strip()
                                       for name, path in self.repositories.items()},
@@ -235,6 +261,8 @@ class Session(Controller):
                 "scope": "Only participating worktrees. Program controls commits and merges. No push, deployment or issue closing."}
 
     def worker(self, phase, ticket, evidence):
+        if "review" not in phase and self.owner.review_only:
+            raise FactoryError("Review-only forbids source workers")
         heads = {name: os.fsdecode(git(path, "rev-parse", "HEAD", "--abbrev-ref", "HEAD"))
                  for name, path in self.repositories.items()}
         pending = self.report.get("pending_source_worker")
@@ -298,6 +326,8 @@ class ControllerV2:
         self.plan_path = Path(plan_path).resolve()
         self.plan, self.sources, self.plan_hash, self.order = load_plan(self.plan_path, investigate)
         self.investigate = investigate
+        self.reviewing = self.plan["input"].get("kind") == "review"
+        self.review_only = self.reviewing and self.plan["input"].get("review_only", False)
         self.output = Path(output_dir).resolve() if output_dir else Path(tempfile.mkdtemp(prefix="software-factory-v2-"))
         if any(self.output == p or p in self.output.parents for p in self.sources.values()):
             raise FactoryError("Output must be outside every source worktree")
@@ -316,7 +346,7 @@ class ControllerV2:
         self.resuming = resume
         self.acquired = False
         self.operation_ready = False
-        self.report = {"version": 2, "run_id": self.run_id, "mode": "investigate" if investigate else "build", "status": "incomplete",
+        self.report = {"version": 2, "run_id": self.run_id, "mode": "investigate" if investigate else ("review" if self.reviewing else "build"), "status": "incomplete",
                        "started_at_aest": now(), "plan_path": str(self.plan_path), "plan_sha256": self.plan_hash,
                        "controller_sha256": self.code_hash, "source_inputs": self.source_inputs,
                        "source_repositories": {n: str(p) for n, p in self.sources.items()},
@@ -331,6 +361,9 @@ class ControllerV2:
                                points=[], investigations=[])
         else:
             self.report["intake"] = self.plan["_intake"]
+            if self.reviewing:
+                self.report["review_only"] = self.review_only
+                self.report["comparison_baselines"] = self.plan["input"]["baselines"]
         if resume:
             self.report = read_json(self.output / "report.json")
             self.run_id = self.report["run_id"]
@@ -434,6 +467,8 @@ class ControllerV2:
         try:
             helper.git_operation(source, "worktree", "add", "-b", branch, str(path), base)
             setup["status"] = "created"
+            if self.reviewing and role == "integration":
+                setup["base_inputs"] = snapshot(path)
         except (FactoryError, OSError):
             setup["status"] = "incomplete"
             raise
@@ -608,6 +643,97 @@ class ControllerV2:
             self.report["repositories"][name].update(
                 head=os.fsdecode(git(path, "rev-parse", "HEAD")).strip(), inputs=exact[name])
 
+    def review_existing(self):
+        intake = self.plan["_intake"]
+        blockers = intake["blockers"] + intake["global_blockers"]
+        if blockers:
+            raise FactoryError("; ".join(blockers))
+        for name, source in self.sources.items():
+            if name not in self.integration:
+                head = os.fsdecode(git(source, "rev-parse", "HEAD")).strip()
+                path, record = self.worktree(name, source, "integration", head)
+                self.integration[name] = path
+                self.report["repositories"][name] = record
+                self.save()
+            record = self.report["repositories"][name]
+            if not record.get("review_seeded"):
+                path = self.integration[name]
+                record["seed_pending"] = True
+                self.save()
+                try:
+                    # The object database is shared. Rebuild the index from entries,
+                    # including conflict stages, rather than copying split-index files.
+                    git(path, "read-tree", "--empty")
+                    proc = subprocess.run(["git", "-C", str(path), "update-index", "-z", "--index-info"],
+                                          input=git(source, "ls-files", "--stage", "-z"), capture_output=True, timeout=30)
+                    if proc.returncode:
+                        raise FactoryError(proc.stderr.decode(errors="replace"))
+                    paths = set(git(path, "ls-files", "-z").split(b"\0")) | set(git(source, "ls-files", "--cached", "--others", "--exclude-standard", "-z").split(b"\0"))
+                    # Include HEAD paths removed from the source index.
+                    paths |= set(git(source, "ls-tree", "-r", "--name-only", "-z", "HEAD").split(b"\0"))
+                    for raw in sorted(paths - {b""}):
+                        relative = os.fsdecode(raw)
+                        origin, target = source / relative, path / relative
+                        if target.is_symlink() or target.is_file():
+                            target.unlink()
+                        elif target.is_dir() and not origin.is_dir():
+                            shutil.rmtree(target)
+                        if not origin.exists() and not origin.is_symlink():
+                            continue
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        if origin.is_symlink():
+                            target.symlink_to(os.readlink(origin))
+                        elif origin.is_file():
+                            shutil.copy2(origin, target)
+                        else:
+                            raise FactoryError("Unsupported review input: " + str(origin))
+                finally:
+                    # Retain the last controller-owned copy state even if a file
+                    # operation is interrupted. Continuation resumes this seed;
+                    # later unexplained edits still need the ordinary adoption gate.
+                    record["inputs"] = snapshot(path)
+                    for setup in self.report["worktree_setups"]:
+                        if setup["worktree"] == str(path):
+                            setup["adopted_inputs"] = record["inputs"]
+                    self.save()
+                self.unchanged()
+                if snapshot(path) != self.source_inputs[name]:
+                    raise FactoryError("Isolated review copy differs from pinned source")
+                record.update(review_seeded=True, inputs=snapshot(path))
+                record.pop("seed_pending", None)
+                self.save()
+        output = self.output / "final"
+        output.mkdir(exist_ok=True)
+        saved = output / "report.json"
+        if saved.exists():
+            baseline = read_json(saved)["baseline"]
+        else:
+            # The comparison is an explicit commit, not the dirty starting patch.
+            baseline = {}
+            for name, head in self.report["comparison_baselines"].items():
+                folder = self.output / "original-baselines" / name
+                folder.mkdir(parents=True, exist_ok=True)
+                patch = folder / "tracked.patch"
+                patch.write_bytes(b"")
+                baseline[name] = {"head": head, "inputs_sha256": self.source_inputs[name],
+                                  "tracked_patch": str(patch), "untracked": []}
+        final = Session(self, self.integration, output, self.plan["tickets"], baseline).restore()
+        self.final_session = final
+        final.save()
+        pending = [f for f in self.report.get("findings", []) if not f.get("resolved")]
+        final.verify_integration(pending)
+        for item in pending:
+            item["resolved"] = True
+        self.unchanged()
+        exact = repository_inputs(self.integration)
+        self.report.update(final_inputs=exact, final_checks=final.report["final_checks"],
+                           final_review=final.report["final_review"], integration_attempts=final.report["integration_attempts"],
+                           final_processes=final.report["processes"], status="reviewed" if self.review_only else "verified")
+        for state in self.report["tickets"].values():
+            state["status"] = "reviewed" if self.review_only else "verified"
+        for name, path in self.integration.items():
+            self.report["repositories"][name].update(head=os.fsdecode(git(path, "rev-parse", "HEAD")).strip(), inputs=exact[name])
+
     def investigate_points(self):
         audit = self.plan["_audit"]
         # Read-only workers get current source including working edits, each in a fresh process.
@@ -648,6 +774,8 @@ class ControllerV2:
                 return self.report
             if self.investigate:
                 self.investigate_points()
+            elif self.reviewing:
+                self.review_existing()
             else:
                 self.build()
         except (FactoryError, OSError, KeyboardInterrupt) as exc:
@@ -671,6 +799,9 @@ class ControllerV2:
             state.update(attempts=session.report["tickets"][tid]["attempts"], processes=session.report["processes"])
         if hasattr(self, "final_session"):
             self.report["final_processes"] = self.final_session.report["processes"]
+            self.report["final_checks"] = self.final_session.report["final_checks"]
+            self.report["final_review"] = self.final_session.report["final_review"]
+            self.report["integration_attempts"] = self.final_session.report.get("integration_attempts", [])
         for state in self.report["tickets"].values():
             if state["status"] == "pending":
                 state["status"] = "not_run"
@@ -700,7 +831,7 @@ class ControllerV2:
         try:
             self.save()
             from factory_lifecycle import complete, finish_claim
-            if self.report["status"] == "verified":
+            if self.report["status"] in ("verified", "reviewed"):
                 try:
                     complete(self.output / "report.json")
                 except (FactoryError, OSError, KeyError, TypeError, ValueError) as exc:
@@ -715,7 +846,7 @@ class ControllerV2:
 
 def report_status(path):
     report = read_json(path)
-    if report.get("mode") == "build" and report.get("status") == "verified":
+    if report.get("mode") in ("build", "review") and report.get("status") in ("verified", "reviewed"):
         from factory_lifecycle import complete
         try:
             return complete(path)

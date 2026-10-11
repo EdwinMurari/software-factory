@@ -1,6 +1,6 @@
 ---
 name: software-factory
-description: Build desired product outcomes or investigate and improve supplied audit points, with recorded product decisions, isolated tasks, measured checks, and fresh review. Use for coding work in new or existing projects; scale the workflow to the change.
+description: Build desired product outcomes, review existing work, or investigate and improve supplied audit points, with recorded product decisions, isolated tasks, measured checks, and fresh review. Use for coding work in new or existing projects; scale the workflow to the change.
 ---
 
 # Software Factory
@@ -9,7 +9,7 @@ Turn the user's intended outcome into a working, checked change. The user owns p
 
 ## Choose the input
 
-Accept either a desired product outcome or an audit to investigate and improve. For audits, preserve every original point and source. Optional groups need a reason. Read [isolated-runner.md](references/isolated-runner.md) and dispatch fresh read-only investigations. Retain confirmed, disproved and blocked findings, evidence and product questions. Ask the user about one material choice at a time. Record the actual decision reference, including approved deferrals; an investigation result is never approval. Map every point to tasks or an explicit disposition. Blocked points keep the overall work incomplete. Desired outcomes need no artificial audit points.
+Accept a desired product outcome, an audit to investigate and improve, or existing work to review. For existing work, read [isolated-runner.md](references/isolated-runner.md), pin an explicit comparison commit for every repository, and use its review input with register/continue. The default fixes scoped findings and repeats fresh checks/reviews to zero findings. “Review only” sets `input.review_only: true`: report findings and check failures without repair or source commits. Resolve material product questions before repair. A missing spec is an explicit report-only limitation, never product approval. For audits, preserve every original point and source. Optional groups need a reason. Read [isolated-runner.md](references/isolated-runner.md) and dispatch fresh read-only investigations. Retain confirmed, disproved and blocked findings, evidence and product questions. Ask the user about one material choice at a time. Record the actual decision reference, including approved deferrals; an investigation result is never approval. Map every point to tasks or an explicit disposition. Blocked points keep the overall work incomplete. Desired outcomes need no artificial audit points.
 
 Use the installed `ask-matt` router to choose external skills within the current stage. Read each selected skill before applying it. The runner enforces execution gates; it does not select workflows or make product decisions.
 

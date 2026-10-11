@@ -1,6 +1,8 @@
 """Review-entry CLI journeys against real dirty Git worktrees."""
 import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 import unittest
 from unittest.mock import patch
@@ -237,20 +239,75 @@ class ReviewTests(unittest.TestCase):
         self.assertFalse((self.f.repo / 'fix.txt').exists())
         self.assertEqual(self.cli('complete', self.report)[0], 0)
 
-    def test_interrupted_failed_checks_still_receive_initial_review(self):
-        self.f.plan['checks'][0]['argv'][-1] = "from pathlib import Path; assert Path('fix.txt').exists()"
+    def assert_failed_check_interruption_retained(self, boundary, only=False):
+        marker = self.f.base / 'check-count'
+        self.f.plan['checks'][0]['argv'][-1] = (
+            "from pathlib import Path; "
+            f"p=Path({str(marker)!r}); ran=p.exists(); p.write_text('ran'); "
+            "raise SystemExit(0 if ran else 1)")
+        self.f.plan['input']['review_only'] = only
         self.f.plan_path.write_text(json.dumps(self.f.plan))
         self.register()
-        owner = factory_v2.ControllerV2(self.f.plan_path, self.output, resume=True)
-        with patch.object(factory_v2.Session, 'worker', side_effect=OSError('review dispatch interrupted')):
-            value = owner.run()
-        self.assertEqual(value['status'], 'incomplete')
-        self.assertEqual(self.f.calls(), [])
+        wrapper = self.f.base / 'interrupt-cli.py'
+        wrapper.write_text(f"import sys; sys.path.insert(0, {str(Path(factory.__file__).parent)!r})\n" +
+            "import factory, factory_v2\nfrom unittest.mock import patch\n" +
+            f"boundary={boundary!r}\n" +
+            "method='execute' if boundary=='check-result' else 'worker'\n" +
+            "original=getattr(factory_v2.Session, method)\n" +
+            "def interrupt(session, *args, **kwargs):\n" +
+            "    label=args[1] if method=='execute' else args[0]\n" +
+            "    if boundary=='review-dispatch' and label=='final_review':\n" +
+            "        raise OSError('Interrupted initial review dispatch')\n" +
+            "    result=original(session, *args, **kwargs)\n" +
+            "    if (boundary=='check-result' and label.startswith('check-')) or (boundary=='review-result' and label=='final_review'):\n" +
+            "        raise OSError('Interrupted validation result handoff')\n" +
+            "    return result\n" +
+            "with patch.object(factory_v2.Session, method, new=interrupt):\n" +
+            "    raise SystemExit(factory.main(sys.argv[1:]))\n")
+        first = subprocess.run([sys.executable, str(wrapper), 'continue', str(self.report)],
+                               capture_output=True, text=True, timeout=90)
+        self.assertNotEqual(first.returncode, 0, first.stdout + first.stderr)
+        interrupted = json.loads(first.stdout)
+        self.assertEqual(interrupted['status'], 'incomplete')
+        self.assertIn('Interrupted', interrupted['reason'])
+        retained = json.loads((self.output / 'final/report.json').read_text())
+        self.assertTrue(any(p['phase'].startswith('check-') and p['status']=='failed'
+                            for p in retained['processes']))
+        before = factory.snapshot(self.f.repo)
         code, value = self.cli('continue', self.report)
         self.assertEqual(code, 0, value)
-        self.assertEqual([c['phase'] for c in self.f.calls()],
+        report = json.loads(self.report.read_text())
+        calls = self.f.calls()
+        self.assertEqual([c['phase'] for c in calls], ['final_review'] if only else
                          ['final_review', 'integration_repair', 'final_review'])
+        self.assertEqual(calls[0]['request']['evidence'][0]['status'], 'failed')
+        self.assertEqual(report['integration_attempts'][0]['checks'][0]['status'], 'failed')
+        if only:
+            self.assertEqual(report['status'], 'reviewed')
+            self.assertEqual(report['final_checks'][0]['status'], 'failed')
+            self.assertFalse((Path(report['repositories']['app']['worktree']) / 'fix.txt').exists())
+        else:
+            self.assertIn('failed', json.dumps(calls[1]['request']['evidence']))
+            self.assertTrue((Path(report['repositories']['app']['worktree']) / 'fix.txt').exists())
+            self.assertEqual(report['final_checks'][0]['status'], 'passed')
+            self.assertNotIn('review', json.dumps(calls[-1]['request']['evidence']))
+        self.assertEqual(factory.snapshot(self.f.repo), before)
         self.assertEqual(self.cli('complete', self.report)[0], 0)
+
+    def test_interrupted_failed_checks_still_receive_initial_review(self):
+        self.assert_failed_check_interruption_retained('review-dispatch')
+
+    def test_failed_initial_check_process_handoff_is_retained(self):
+        self.assert_failed_check_interruption_retained('check-result')
+
+    def test_failed_initial_check_review_result_handoff_is_retained(self):
+        self.assert_failed_check_interruption_retained('review-result')
+
+    def test_report_only_retains_failed_check_after_review_interruption(self):
+        self.assert_failed_check_interruption_retained('review-dispatch', only=True)
+
+    def test_report_only_retains_failed_check_after_review_result_handoff(self):
+        self.assert_failed_check_interruption_retained('review-result', only=True)
 
     def test_report_only_findings_and_stale_evidence(self):
         self.configure(findings=True)

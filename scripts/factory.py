@@ -740,6 +740,7 @@ class Controller:
             raise FactoryError(self.report["integration_validation_stop"])
         required = [c for tid in self.order for c in self.tickets[tid]["checks"]]
         review_existing = self.plan.get("input", {}).get("kind") == "review"
+        review_only = self.plan.get("input", {}).get("review_only", False)
         self.report.setdefault("integration_attempts", [])
         seen = set(self.report.get("integration_progress_inputs", []))
         evidence = []
@@ -757,6 +758,7 @@ class Controller:
             # after interruption. Unchanged findings still require a repair.
             if checkpoint["progress"] == self.progress():
                 evidence = findings
+        resume_initial_review = None
         previous = self.report["integration_attempts"][-1] if self.report["integration_attempts"] else None
         if previous:
             self.recover_validation(previous, required + self.plan["integration_checks"], "final_review")
@@ -765,12 +767,18 @@ class Controller:
             # another source mutation when the failure describes today's inputs.
             current = self.inputs()
             same_inputs = checks and all(c.get("inputs_sha256") == current for c in checks)
-            if same_inputs and review and review["status"] == "changes_requested":
+            if same_inputs and review_only and any(c["status"] == "failed" for c in checks):
+                resume_initial_review = previous
+            elif same_inputs and review and review["status"] == "changes_requested":
                 evidence += [{"review": review, "checks": self.failure_evidence(checks)}]
-            elif (same_inputs and any(c["status"] == "failed" for c in checks)
-                  and (review is not None or not review_existing)):
-                evidence += self.failure_evidence(checks)
-        review_only = self.plan.get("input", {}).get("review_only", False)
+            elif same_inputs and any(c["status"] == "failed" for c in checks):
+                if review_existing and review is None:
+                    # The check process can be saved before its attempt or
+                    # review handoff. Review that retained failure first; a
+                    # lucky rerun must not replace it before a source repair.
+                    resume_initial_review = previous
+                else:
+                    evidence += self.failure_evidence(checks)
         if review_only:
             evidence = []
         if review_only and self.report.get("pending_source_worker"):
@@ -794,15 +802,20 @@ class Controller:
                     self.report.pop("pending_source_worker", None)
                     self.save()
                     raise FactoryError("Integration repair made no source progress; stopped")
-            progress = self.progress()
-            entry = {"number": len(self.report["integration_attempts"]) + 1, "checks": [], "review": None,
-                     "validation_process_index": len(self.report["processes"])}
-            self.report["integration_attempts"].append(entry)
-            seen.add(progress)
-            self.report["integration_progress_inputs"] = sorted(seen)
-            self.report.pop("pending_source_worker", None)
-            self.save()
-            checks = self.run_checks(required + self.plan["integration_checks"])
+            if (attempt == 0 and resume_initial_review is not None and not evidence
+                    and not (pending and pending["label"] == "integration_repair")):
+                entry = resume_initial_review
+                checks = entry["checks"]
+            else:
+                progress = self.progress()
+                entry = {"number": len(self.report["integration_attempts"]) + 1, "checks": [], "review": None,
+                         "validation_process_index": len(self.report["processes"])}
+                self.report["integration_attempts"].append(entry)
+                seen.add(progress)
+                self.report["integration_progress_inputs"] = sorted(seen)
+                self.report.pop("pending_source_worker", None)
+                self.save()
+                checks = self.run_checks(required + self.plan["integration_checks"])
             entry["checks"] = self.report["final_checks"] = checks
             self.save()
             if any(c["status"] not in ("passed", "failed") for c in checks):
@@ -816,7 +829,7 @@ class Controller:
                 evidence = self.failure_evidence(checks)
                 continue
             try:
-                review = self.worker("final_review", None, self.failure_evidence(checks))
+                review = entry.get("review") or self.worker("final_review", None, self.failure_evidence(checks))
             except FactoryError as exc:
                 if self.plan.get("input", {}).get("kind") == "review":
                     self.report["integration_validation_stop"] = str(exc)

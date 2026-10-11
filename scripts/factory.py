@@ -149,15 +149,23 @@ def snapshot(project, content_only=False):
     for raw in sorted(paths - {b""}):
         path = Path(project) / os.fsdecode(raw)
         try:
+            # An indexed file replaced by a directory is deleted in the worktree.
+            # Its listed children are separate inputs. A replaced parent also
+            # deletes old descendants; never follow a symlink to external files.
+            if any((Path(project) / parent).is_symlink()
+                   for parent in Path(os.fsdecode(raw)).parents):
+                raise FileNotFoundError(path)
             info = path.lstat()
             if stat.S_ISLNK(info.st_mode):
                 content = os.fsencode(os.readlink(path))
             elif stat.S_ISREG(info.st_mode):
                 content = path.read_bytes()
+            elif stat.S_ISDIR(info.st_mode):
+                raise FileNotFoundError(path)
             else:
                 raise FactoryError(f"Unsupported source input: {path}")
-            records.append([os.fsdecode(raw), stat.S_IMODE(info.st_mode), digest(content)])
-        except FileNotFoundError:
+            records.append([os.fsdecode(raw), stat.S_IFMT(info.st_mode), stat.S_IMODE(info.st_mode), digest(content)])
+        except (FileNotFoundError, NotADirectoryError):
             # Missing index paths disappear when the controller commits existing
             # dirt. That changes input evidence, but is not a source edit.
             if not content_only:

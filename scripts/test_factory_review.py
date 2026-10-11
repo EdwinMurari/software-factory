@@ -58,21 +58,101 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(self.cli('complete', self.report)[0], 0)
 
     def test_deleted_tracked_file_replaced_by_directory(self):
+        self.assert_tracked_file_replaced_by_directory(staged=True)
+
+    def test_unstaged_tracked_file_replaced_by_directory(self):
+        self.assert_tracked_file_replaced_by_directory(staged=False)
+
+    def assert_tracked_file_replaced_by_directory(self, staged):
         repo = self.f.repo
-        self.f.git(repo, 'rm', 'existing.txt')
+        if staged:
+            self.f.git(repo, 'rm', 'existing.txt')
+        else:
+            (repo / 'existing.txt').unlink()
         (repo / 'existing.txt').mkdir()
         (repo / 'existing.txt' / 'child.txt').write_text('replacement child')
         self.f.plan['checks'][0]['argv'][-1] = (
             "from pathlib import Path; assert Path('existing.txt/child.txt').read_text() == 'replacement child'")
         self.f.plan_path.write_text(json.dumps(self.f.plan))
-        before = factory.snapshot(repo)
+        before = self.f.git(repo, 'status', '--porcelain=v1', '-z')
         code, value, report = self.review()
         self.assertEqual(code, 0, value)
         copy = Path(report['repositories']['app']['worktree'])
         self.assertEqual((copy / 'existing.txt/child.txt').read_text(), 'replacement child')
-        self.assertEqual(factory.snapshot(repo), before)
+        self.assertEqual(self.f.git(repo, 'status', '--porcelain=v1', '-z'), before)
         self.assertEqual(self.f.git(copy, 'status', '--short'), self.f.git(repo, 'status', '--short'))
+        self.assertEqual(self.f.git(copy, 'ls-files', '--stage'), self.f.git(repo, 'ls-files', '--stage'))
+        self.assertEqual((repo / 'existing.txt/child.txt').read_text(), 'replacement child')
         self.assertEqual([c['phase'] for c in self.f.calls()], ['final_review'])
+        self.assertEqual(self.cli('complete', self.report)[0], 0)
+
+    def test_unstaged_tracked_directory_replaced_by_regular_file(self):
+        repo = self.f.repo
+        directory = repo / 'directory'
+        directory.mkdir()
+        child = directory / 'tracked.txt'
+        child.write_text('old tracked content')
+        self.f.git(repo, 'add', '.')
+        self.f.git(repo, 'commit', '-qm', 'tracked directory')
+        child.unlink()
+        directory.rmdir()
+        directory.write_text('replacement file')
+        self.f.plan['checks'][0]['argv'][-1] = (
+            "from pathlib import Path; assert Path('directory').read_text() == 'replacement file'")
+        self.f.plan_path.write_text(json.dumps(self.f.plan))
+        before = self.f.git(repo, 'status', '--porcelain=v1', '-z')
+        code, value, report = self.review(only=True)
+        self.assertEqual(code, 0, value)
+        copy = Path(report['repositories']['app']['worktree'])
+        self.assertEqual((copy / 'directory').read_text(), 'replacement file')
+        self.assertEqual(self.f.git(repo, 'status', '--porcelain=v1', '-z'), before)
+        self.assertEqual(self.f.git(copy, 'status', '--short'), self.f.git(repo, 'status', '--short'))
+        self.assertEqual(self.f.git(copy, 'diff', '--cached'), self.f.git(repo, 'diff', '--cached'))
+        self.assertEqual((repo / 'directory').read_text(), 'replacement file')
+        self.assertEqual([c['phase'] for c in self.f.calls()], ['final_review'])
+        self.assertEqual(self.cli('complete', self.report)[0], 0)
+
+    def tracked_link(self):
+        link = self.f.repo / 'link'
+        link.symlink_to('existing.txt')
+        self.f.git(self.f.repo, 'add', 'link')
+        self.f.git(self.f.repo, 'commit', '-qm', 'tracked symlink')
+        return link.lstat().st_mode & 0o777
+
+    def test_report_only_same_bytes_and_mode_type_mutation_is_stale(self):
+        mode = self.tracked_link()
+        before = factory.snapshot(self.f.repo)
+        code, value, report = self.review(only=True)
+        self.assertEqual(code, 0, value)
+        link = Path(report['repositories']['app']['worktree']) / 'link'
+        link.unlink()
+        link.write_text('existing.txt')
+        link.chmod(mode)
+        self.assertEqual(self.cli('status', self.report)[1]['status'], 'stale')
+        self.assertNotEqual(self.cli('continue', self.report)[0], 0)
+        self.assertNotEqual(self.cli('complete', self.report)[0], 0)
+        self.assertEqual(factory.snapshot(self.f.repo), before)
+        self.assertEqual([c['phase'] for c in self.f.calls()], ['final_review'])
+
+    def test_same_bytes_and_mode_type_repair_is_source_progress(self):
+        mode = self.tracked_link()
+        self.f.fake.write_text(self.f.fake.read_text().replace(
+            "p = path / 'fix.txt'\n        p.write_text(p.read_text() + 'x' if p.exists() else 'x')",
+            "p = path / 'link'\n        mode = p.lstat().st_mode & 0o777\n"
+            "        p.unlink()\n        p.write_text('existing.txt')\n        p.chmod(mode)").replace(
+            "not all((p/'fix.txt').exists() for p in paths.values())",
+            "any((p/'link').is_symlink() for p in paths.values())"))
+        self.configure(findings=True)
+        before = factory.snapshot(self.f.repo)
+        code, value, report = self.review()
+        self.assertEqual(code, 0, value)
+        link = Path(report['repositories']['app']['worktree']) / 'link'
+        self.assertFalse(link.is_symlink())
+        self.assertEqual(link.read_text(), 'existing.txt')
+        self.assertEqual(link.stat().st_mode & 0o777, mode)
+        self.assertEqual(factory.snapshot(self.f.repo), before)
+        self.assertEqual([c['phase'] for c in self.f.calls()],
+                         ['final_review', 'integration_repair', 'final_review'])
         self.assertEqual(self.cli('complete', self.report)[0], 0)
 
     def test_deleted_tracked_directory_replaced_by_symlink(self):

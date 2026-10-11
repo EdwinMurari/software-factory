@@ -709,6 +709,7 @@ class ControllerV2:
                         target.parent.mkdir(parents=True, exist_ok=True)
                         if origin.is_symlink():
                             target.symlink_to(os.readlink(origin))
+                            shutil.copystat(origin, target, follow_symlinks=False)
                         elif origin.is_file():
                             shutil.copy2(origin, target)
                         elif origin.is_dir():

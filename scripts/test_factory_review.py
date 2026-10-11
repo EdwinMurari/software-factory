@@ -59,6 +59,45 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(Path(baseline['tracked_patch']).read_bytes(), b'')
         self.assertEqual(self.cli('complete', self.report)[0], 0)
 
+    @unittest.skipUnless(os.chmod in os.supports_follow_symlinks,
+                         'Host does not support changing symlink modes without following targets')
+    def test_symlink_modes_are_preserved_in_review_and_repair(self):
+        self.assert_symlink_modes_preserved(only=False)
+
+    @unittest.skipUnless(os.chmod in os.supports_follow_symlinks,
+                         'Host does not support changing symlink modes without following targets')
+    def test_symlink_modes_are_preserved_in_review_only(self):
+        self.assert_symlink_modes_preserved(only=True)
+
+    def assert_symlink_modes_preserved(self, only):
+        external = self.f.base / 'external.txt'
+        external.write_text('external content')
+        external.chmod(0o640)
+        external_before = external.stat()
+        links = [('external-link', str(external), 0o700),
+                 ('broken-link', 'missing-target', 0o711),
+                 ('directory-link', str(self.f.base), 0o740)]
+        for name, target, mode in links:
+            link = self.f.repo / name
+            link.symlink_to(target)
+            os.chmod(link, mode, follow_symlinks=False)
+            self.assertEqual(link.lstat().st_mode & 0o7777, mode)
+        directory_mode = self.f.base.stat().st_mode
+        before = factory.snapshot(self.f.repo)
+        code, value, report = self.review(only=only)
+        self.assertEqual(code, 0, value)
+        copy = Path(report['repositories']['app']['worktree'])
+        for name, target, mode in links:
+            self.assertEqual(os.readlink(copy / name), target)
+            self.assertEqual((copy / name).lstat().st_mode & 0o7777, mode)
+        self.assertEqual(factory.snapshot(self.f.repo), before)
+        self.assertEqual(external.read_text(), 'external content')
+        self.assertEqual(external.stat().st_mode, external_before.st_mode)
+        self.assertEqual(external.stat().st_mtime_ns, external_before.st_mtime_ns)
+        self.assertEqual(self.f.base.stat().st_mode, directory_mode)
+        self.assertEqual([c['phase'] for c in self.f.calls()], ['final_review'])
+        self.assertEqual(self.cli('complete', self.report)[0], 0)
+
     def test_deleted_tracked_file_replaced_by_directory(self):
         self.assert_tracked_file_replaced_by_directory(staged=True)
 

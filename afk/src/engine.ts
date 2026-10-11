@@ -25,10 +25,10 @@ export async function executeJob(
   );
   if (dirty.code || dirty.output.trim())
     throw new Incomplete(
-      "Registered repository must be clean; preserve and commit current work before submission",
+      "Repository must be clean; preserve and commit current work before starting a run",
     );
   const initial = await sourceHash(config.root, signal);
-  const registeredGit = await gitState(config.root, signal);
+  const sourceGit = await gitState(config.root, signal);
   const head = await command(config.root, "git", ["rev-parse", "HEAD"], signal);
   if (head.code) throw new Incomplete("No git baseline");
   const baseline = comparisonBase ?? head.output.trim();
@@ -138,13 +138,13 @@ export async function executeJob(
   ).output.trim();
   const observedSource = await sourceHash(config.root, signal);
   if (observedHead !== head.output.trim() || observedSource !== initial)
-    throw new Incomplete("Registered source changed before final review");
-  if ((await gitState(config.root, signal)) !== registeredGit)
-    throw new Incomplete("Registered Git state changed before final review");
+    throw new Incomplete("Source changed before final review");
+  if ((await gitState(config.root, signal)) !== sourceGit)
+    throw new Incomplete("Source Git state changed before final review");
   const controllerEvidence = {
     stage: "combined",
-    registeredHead: { baseline: head.output.trim(), current: observedHead },
-    registeredSource: { baseline: initial, current: observedSource },
+    sourceHead: { baseline: head.output.trim(), current: observedHead },
+    sourceSnapshot: { baseline: initial, current: observedSource },
     outputBranch: (
       await command(target, "git", ["branch", "--show-current"], signal)
     ).output.trim(),
@@ -170,11 +170,11 @@ export async function executeJob(
       await command(config.root, "git", ["rev-parse", "HEAD"], signal)
     ).output.trim() !== head.output.trim()
   )
-    throw new Incomplete("Registered source HEAD changed during job");
+    throw new Incomplete("Source HEAD changed during job");
   if ((await sourceHash(config.root, signal)) !== initial)
-    throw new Incomplete("Registered source changed during job");
-  if ((await gitState(config.root, signal)) !== registeredGit)
-    throw new Incomplete("Registered Git state changed during job");
+    throw new Incomplete("Source changed during job");
+  if ((await gitState(config.root, signal)) !== sourceGit)
+    throw new Incomplete("Source Git state changed during job");
   const published = await publish(target, signal);
   // Publication must retain the exact source and Git state accepted by review.
   // Keep the checked hash authoritative; never replace it with a later sample.

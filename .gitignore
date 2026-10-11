@@ -4,5 +4,4 @@ __pycache__/
 .env
 .env.*
 node_modules/
-afk/*.sqlite*
 afk/node_modules

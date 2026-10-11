@@ -7,51 +7,43 @@ description: Build desired product outcomes, review existing work, or investigat
 
 Turn the user's intended outcome into a working, checked change. The user owns product choices. You own routine engineering within that agreement. Follow the existing project conventions and use its commands. Keep one authoritative implementation per behaviour.
 
-There is one factory: the Berry queue on `gl502`. It runs Sandcastle with `noSandbox()` on the host. Use the installed `ask-matt` router dynamically to pick external skills for the current stage. Read each selected skill before applying it. This skill holds no skill catalogue.
+There is one reusable pipeline, with independent instances. Each invocation starts immediately on `gl502` through the installed `berry-afk` CLI. Sandcastle runs fresh agent sessions with `noSandbox()` on the host. Use the installed `ask-matt` router dynamically for external skills, and read each selected skill. This skill holds no skill catalogue.
 
 ## Route the request
 
-- **Explicit software-factory request** (build, review-repair or review-only; "AFK" wording is optional): finish intake in chat, then submit an approved spec to the Berry queue.
-- **Implicit small change:** work in the current session. Use the quality guidance below: a focused failing example, focused checks and a review.
-- **Implicit substantial change:** do intake, then submit it to the same queue.
-- **Factory worker** (a stage run by the queue): do only the assigned stage and return its result schema. Never launch a nested factory.
+- **Explicit software-factory request:** finish product intake, then start an independent `build`, `review-repair` or `review-only` run. AFK wording is optional.
+- **Implicit small change:** work in the current session with a focused failing example, proportionate checks and review.
+- **Implicit substantial change:** do intake, then start an independent run.
+- **Factory worker:** perform only the assigned stage and return its result schema. Never launch a nested factory.
 
 ## Intake
 
-Read the request and relevant code before asking questions. State the intended outcome, the acceptance scenarios and what is out of scope. Read [product-contract.md](references/product-contract.md) for new features, vague requests or conflicting requirements. Resolve each material choice about behaviour, scope, architecture, cost or risk with the user, one at a time, with a recommendation. An investigation result or a proposal is never approval. An unresolved material question is blocked work.
+Read the request and relevant code before asking questions. State the intended outcome, acceptance scenarios and exclusions. Read [product-contract.md](references/product-contract.md) for new features, vague requests or conflicting requirements. Resolve material choices about behaviour, scope, architecture, cost or risk with the user, one at a time, with a recommendation. An investigation or proposal is never approval. Unresolved material choices block execution.
 
-For an audit, investigate during intake, before submission. Keep every original point and its source. Keep confirmed, disproved and blocked findings with evidence. Record the user's decision for each product question, including approved deferrals. Submit only the approved spec.
+For an audit, investigate during intake. Preserve every original point and source, with evidence for confirmed, disproved and blocked findings. Record actual product decisions and approved deferrals. Start only the approved scope.
 
-## Scope of the queue
+## Start and follow a run
 
-- One registered, clean repository per job. There is no multi-repo job.
-- Whole-codebase review scope must be stated in the spec. The queue gives no automatic per-module coverage guarantee.
-- **Review-only** inspects work against a pinned baseline and reports findings. It does not repair.
-- **Review-repair** repeats fresh reviews and repairs until there are zero findings, green checks and verified acceptance.
-- Round limits, timeouts, no progress, cancellation and blockers leave the job incomplete. Do not weaken a gate to pass.
-- Missing product requirements are an explicit review limitation. A review without a spec reports that limit; it approves nothing.
-- An integration conflict stops the job incomplete. No automated conflict-repair worker exists. Inspect the retained work, then submit a newly approved request.
-- An interrupted job is incomplete. Inspect the retained work and evidence, then submit a newly approved request with a new key, as the deployed guide describes. No resume, adopt, reopen or close command exists.
-
-## Submit
-
-Read the deployed guide first:
+Read the deployed guide before invoking the runner:
 
 ```sh
 ssh gl502 'cat /srv/appdata/berry/projects/services/software-factory/afk/README.md'
 ```
 
-Copy the approved spec to the host, then submit and query:
+Use one clean repository and its explicit project config. The config selects trusted checks, provider/model and limits. A scaffold contains config and specs; shared steps stay in the installed factory. No central registration, shared queue or service is required. For unattended execution, use a separate transient unit per invocation as the guide describes.
 
-```sh
-scp approved-spec.md gl502:/tmp/approved-spec.md
-ssh gl502 '/home/berry/.local/bin/berry-afk submit --repository REGISTERED_ID --flow build --spec /tmp/approved-spec.md --key STABLE_KEY'
-ssh gl502 '/home/berry/.local/bin/berry-afk status JOB_ID'
-```
+Copy the approved spec to the host, then start the CLI with `run --config FILE --spec FILE --flow FLOW`. Record the unique run directory printed at startup. Follow that instance with `status RUN_DIRECTORY`; cancel it with `cancel RUN_DIRECTORY`. Both review flows require `--baseline FULL_40_CHARACTER_COMMIT_SHA`. Multiple runs can use the same project with separate worktrees and evidence. Worktrees do not provide a sandbox.
 
-Flows are `build`, `review-repair` and `review-only`. The two review flows need `--baseline FULL_40_CHARACTER_COMMIT_SHA`. For an unregistered project, register its repository root and trusted checks through authorized operator access as the guide describes. A coding agent with that access can do this. Report blocked if access or project authorization is missing. Do not auto-enable arbitrary repositories.
+Report the run directory and durable status. Completion requires the runner's complete result plus observed acceptance evidence. The pipeline retains its output branch/worktree; it has no push or deployment step.
 
-Report the job ID and the durable status. Completion needs a complete job and observed acceptance evidence. Report blocked, cancelled or interrupted work as incomplete. The queue does not push or deploy; the retained branch and worktree are the output.
+## Scope and stops
+
+- One clean repository per run. Whole-codebase review scope must be explicit; there is no automatic per-module coverage guarantee.
+- **Review-only** reports findings without repair. Missing requirements remain an explicit limitation, not approval.
+- **Review-repair** repeats fresh review and repair until zero findings, passing checks and verified acceptance.
+- Limits, timeout, no progress, cancellation, interruption and blockers leave the run incomplete. Never weaken a gate to pass.
+- Integration conflicts stop incomplete. Inspect retained work and resolve the cause before a new approved run. There is no automatic conflict repair or resume.
+- A run can wait for its own dependencies. It does not wait for another factory user. Preserve other instances and their retained work.
 
 ## Quality guidance
 

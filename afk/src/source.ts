@@ -1,9 +1,14 @@
 import { createHash } from "node:crypto";
-import { spawn } from "node:child_process";
+import { fork } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { readFile, lstat, readlink, stat } from "node:fs/promises";
-import { resolve, relative, isAbsolute } from "node:path";
+import { resolve, relative, isAbsolute, sep } from "node:path";
 import type { Check, CheckEvidence, FileIntegrity } from "./contracts.js";
 import { Incomplete } from "./contracts.js";
+export function isWithin(root: string, path: string): boolean {
+  const rel = relative(root, path);
+  return rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel);
+}
 export const hash = (value: string | Buffer) =>
   createHash("sha256").update(value).digest("hex");
 export async function command(
@@ -15,12 +20,18 @@ export async function command(
 ): Promise<{ code: number; output: string }> {
   signal?.throwIfAborted();
   return new Promise((done, reject) => {
-    const child = spawn(exe, args, {
-      cwd,
-      detached: true,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+    const child = fork(
+      fileURLToPath(new URL("./command-worker.js", import.meta.url)),
+      [],
+      {
+        detached: true,
+        execArgv: [],
+        stdio: ["ignore", "pipe", "pipe", "ipc"],
+      },
+    );
     let output = "";
+    let resultCode: number | undefined;
+    let failure: Error | undefined;
     const machine: Buffer[] = [];
     const append = (b: Buffer) => {
       output = (output + b.toString()).slice(-32000);
@@ -36,27 +47,54 @@ export async function command(
     };
     const abort = () => kill();
     signal?.addEventListener("abort", abort, { once: true });
-    child.stdout.on("data", (chunk: Buffer) =>
+    child.stdout!.on("data", (chunk: Buffer) =>
       capture === "machine" ? machine.push(chunk) : append(chunk),
     );
-    child.stderr.on("data", append);
+    child.stderr!.on("data", append);
     child.on("error", (error) => {
       signal?.removeEventListener("abort", abort);
       reject(error);
     });
-    child.on("close", (code) => {
+    child.on("message", (raw) => {
+      const message = raw as {
+        code?: unknown;
+        error?: unknown;
+        errorCode?: unknown;
+      };
+      if (typeof message.error === "string") {
+        failure = Object.assign(new Error(message.error), {
+          code: message.errorCode,
+        });
+      } else if (typeof message.code === "number") {
+        resultCode = message.code;
+      } else {
+        failure = new Incomplete("Invalid command supervisor response");
+      }
+      kill();
+    });
+    child.on("close", () => {
       signal?.removeEventListener("abort", abort);
       kill();
       if (signal?.aborted)
         reject(signal.reason ?? new Incomplete("Check aborted"));
+      else if (failure) reject(failure);
+      else if (resultCode === undefined)
+        reject(new Incomplete("Command supervisor exited without a result"));
       else
         done({
-          code: code ?? -1,
+          code: resultCode,
           output:
             capture === "machine"
-              ? Buffer.concat(machine).toString("utf8") + (code ? output : "")
+              ? Buffer.concat(machine).toString("utf8") +
+                (resultCode ? output : "")
               : output,
         });
+    });
+    child.send({ cwd, exe, args }, (error) => {
+      if (error) {
+        failure = error;
+        kill();
+      }
     });
     if (signal?.aborted) abort();
   });
@@ -77,10 +115,8 @@ export async function sourceHash(
   const pieces: string[] = [];
   for (const path of paths) {
     signal?.throwIfAborted();
-    const full = resolve(root, path),
-      rel = relative(root, full);
-    if (isAbsolute(rel) || rel.startsWith(".."))
-      throw new Incomplete("Source escapes root");
+    const full = resolve(root, path);
+    if (!isWithin(root, full)) throw new Incomplete("Source escapes root");
     try {
       const stat = await lstat(full);
       pieces.push(
@@ -169,7 +205,7 @@ export async function pinCheck(check: Check): Promise<Check> {
             current.fingerprintSha256 === pin.fingerprintSha256,
         )
       )
-        throw new Incomplete("Registered check integrity changed");
+        throw new Incomplete("Configured check integrity changed");
     }
   }
   return { ...check, integrity };
@@ -180,7 +216,7 @@ export async function checkSource(
   signal?: AbortSignal,
   record?: (evidence: CheckEvidence[]) => void,
 ): Promise<CheckEvidence[]> {
-  if (!checks.length) throw new Incomplete("No registered checks");
+  if (!checks.length) throw new Incomplete("No configured checks");
   const before = await sourceHash(root, signal),
     results: CheckEvidence[] = [];
   const beforeGit = await gitState(root, signal);
@@ -189,7 +225,7 @@ export async function checkSource(
     for (const pin of check.integrity ?? [])
       if ((await fileIntegrity(pin.path)) !== pin.fingerprintSha256)
         throw new Incomplete(
-          "Registered check integrity changed before execution",
+          "Configured check integrity changed before execution",
         );
     const r = await command(root, check.command, check.args, signal);
     results.push({
@@ -220,7 +256,7 @@ export async function checkSource(
   }
   record?.(results);
   if (integrityChanged)
-    throw new Incomplete("Registered check integrity changed during execution");
+    throw new Incomplete("Configured check integrity changed during execution");
   if ((await sourceHash(root, signal)) !== before)
     throw new Incomplete("Checks changed source");
   if ((await gitState(root, signal)) !== beforeGit)

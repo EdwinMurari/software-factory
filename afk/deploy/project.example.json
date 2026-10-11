@@ -1,0 +1,12 @@
+{
+  "root": "/absolute/canonical/project/path",
+  "standards": "Follow this repository's AGENTS.md and the approved product scope.",
+  "checks": [
+    { "id": "test", "command": "/absolute/path/to/node", "args": ["--test"] }
+  ],
+  "worker": { "provider": "codex", "model": "gpt-6-astra" },
+  "maxRounds": 6,
+  "maxTickets": 12,
+  "maxConcurrency": 2,
+  "timeoutMs": 1800000
+}

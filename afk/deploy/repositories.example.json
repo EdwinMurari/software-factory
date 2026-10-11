@@ -1,5 +1,0 @@
-{
-  "socketPath": "/srv/appdata/berry/state/services/software-factory/api.sock",
-  "databasePath": "/srv/appdata/berry/state/services/software-factory/queue.sqlite",
-  "repositories": {}
-}

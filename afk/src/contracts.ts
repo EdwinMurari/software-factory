@@ -16,7 +16,11 @@ export interface RepositoryConfig {
   root: string;
   standards: string;
   checks: Check[];
-  worker: { provider: "codex" | "claude"; model: string };
+  worker: {
+    provider: "codex" | "claude";
+    model: string;
+    effort?: "low" | "medium" | "high" | "xhigh";
+  };
   maxRounds: number;
   maxTickets: number;
   maxConcurrency: number;

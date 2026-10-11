@@ -41,12 +41,12 @@ Reuse an existing spec and issue tracker when present. A new tracker or mandator
 
 Choose tasks that cross enough of the application to prove one useful behaviour. Avoid splitting into “all models”, “all APIs”, and “all UI” when none provides feedback alone. Keep tasks small enough for a fresh worker to implement and verify. Review the combined user journey at the end.
 
-The submitted spec is an execution input, not proof that a human approved a product decision. Preserve the actual decision in the chat/spec and flag unresolved choices explicitly.
+The run spec is an execution input, not proof that a human approved a product decision. Preserve the actual decision in the chat/spec and flag unresolved choices explicitly.
 
 ## Audit intake
 
 Keep every supplied point with its source references. Group only with an explicit reason, then investigate each point or group in a fresh read-only worker. Record evidence and a confirmed, disproved or blocked disposition. Working changes are part of investigation freshness.
 
-Use the installed `ask-matt` router for the next workflow; read the selected skill. Ask about each material product question separately. Preserve the actual user decision in the approved spec or its existing source record. Resolve material choices before submission. These are intake responsibilities; the queue does not validate decision IDs or response-file hashes.
+Use the installed `ask-matt` router for the next workflow; read the selected skill. Ask about each material product question separately. Preserve the actual user decision in the approved spec or its existing source record. Resolve material choices before execution. These are intake responsibilities; the pipeline does not validate decision IDs or response-file hashes.
 
 Map each point to approved tasks, a disproved finding, a blocker, or a user-approved deferral. Include relevant approved decisions in the spec so fresh workers receive them. Keep deferrals distinct from implemented work. If sources, points, evidence or decision records change, investigate or agree again where needed before building.

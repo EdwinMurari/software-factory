@@ -312,7 +312,7 @@ test("source fingerprints include executable mode and symlink targets without fo
   await symlink("/missing-target-two", join(root, "link"));
   assert.notEqual(await sourceHash(root), one);
 });
-test("external registered checks are pinned and mutations preserve failed integrity evidence", async () => {
+test("external configured checks are pinned and mutations preserve failed integrity evidence", async () => {
   const { pinCheck } = await import("../src/source.js");
   const root = await repo();
   const outside = await mkdtemp(join(tmpdir(), "afk-external-"));

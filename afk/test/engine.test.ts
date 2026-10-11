@@ -92,7 +92,7 @@ test("ready graph runs independent tickets and dependent ticket sees combined st
       req.cwd.endsWith("tree") &&
       req.prompt.includes("Judge all spec acceptance")
     )
-      assert.match(req.prompt, /Controller state evidence.*registeredHead/);
+      assert.match(req.prompt, /Controller state evidence.*sourceHead/);
     const matched = req.prompt.match(
       /Required coverage criteria: (\[[^\n]*?\])/,
     );

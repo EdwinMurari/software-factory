@@ -1,57 +1,58 @@
-# Berry AFK queue
+# Independent factory runs
 
-This opt-in service runs approved specs without an interactive session. It uses pinned `@ai-hero/sandcastle` 0.12.0 for isolated worktrees and fresh Codex or Claude sessions with `noSandbox()`. Host execution is an explicit deployment choice. The default adapter is Codex `gpt-6-astra`; the service requires an explicit provider and model in each registered repository configuration.
+Every `run` invocation executes the shared pipeline in its own process. There is no scheduler, pool, queue, API socket or resident service. Any coding agent can invoke the same CLI. Each worker call uses pinned Sandcastle 0.12.0 and a fresh Codex or Claude session with `noSandbox()`.
 
-Node 26 is required for `node:sqlite`. Install with `npm ci`, run `npm run typecheck` and `npm test` in `afk/`. Default tests need no model credentials. They use real SQLite, files and Git. The runtime fixture exercises the real Sandcastle package with a disposable fake executable. Live model evidence is a separate host check.
+## Configure a project
 
-## Register and run
+Copy [project.example.json](deploy/project.example.json) to a project-owned configuration file. Set the absolute canonical repository root, standards, trusted checks, provider/model and limits. On Berry, keep configuration under `/srv/appdata/berry/config/software-factory/` and run evidence under `/srv/appdata/berry/state/services/software-factory/runs/`. A config belongs to one project; it is not a central registry. Reuse the same file for independent invocations.
 
-Only the local service account can change the protected configuration. The caller can select a repository ID, flow, immutable spec, idempotency key and comparison baseline. It cannot select a host path, command or model. The service pins check executables and existing absolute regular-file arguments when loading registration, then checks their hashes before and after each run. Evidence labels raw file bytes as `contentSha256`, which matches `sha256sum`. A separate `fingerprintSha256` includes decimal `lstat.mode`, symlink target and the content hash. Before/after values and the composite algorithm are recorded explicitly. Transitive dependencies, relative arguments and environment values outside the repository are not fingerprinted; register stable, credential-free checks. Registered checks are trusted executable paths with argument arrays; no shell evaluation is used. Never register untrusted commands. Keep the checkout clean; preserve and commit local changes before submission. Ignore `.sandcastle/worktrees/` and `.sandcastle/logs/` in registered repositories before use. Sandcastle runtime metadata must not enter the source fingerprint.
+Checks use absolute executable paths and argument arrays, without shell evaluation. The runner pins executables and existing absolute regular-file arguments before execution. Evidence records raw `contentSha256` and metadata-inclusive `fingerprintSha256`, before and after each check. Transitive dependencies, relative arguments and external environment values are not fingerprinted. Use stable, credential-free checks. Configuration authorizes host execution; do not use untrusted commands or place secrets in specs/configs.
 
-```json
-{
-  "socketPath": "/srv/appdata/berry/state/services/software-factory/api.sock",
-  "databasePath": "/srv/appdata/berry/state/services/software-factory/queue.sqlite",
-  "repositories": {
-    "example": {
-      "root": "/srv/appdata/example/source",
-      "standards": "Use the repository AGENTS.md and preserve the approved scope.",
-      "checks": [{"id":"test","command":"/home/berry/.nvm/versions/node/v26.5.0/bin/node","args":["--test"]}],
-      "worker": {"provider":"codex","model":"gpt-6-astra"},
-      "maxRounds": 4,
-      "maxTickets": 12,
-      "maxConcurrency": 2,
-      "timeoutMs": 1200000
-    }
-  }
-}
-```
+The checkout must be clean. Preserve and commit current work before starting. The run snapshots its input and config; later config edits apply to new runs. Project scaffolds contain only this configuration and product specs. Shared TypeScript steps remain the single pipeline implementation.
+
+## Run and inspect
 
 ```sh
-BERRY_AFK_CONFIG=/srv/appdata/berry/config/software-factory/repositories.json npm start
-npm run cli -- --socket /srv/appdata/berry/state/services/software-factory/api.sock submit --repository example --flow build --spec /tmp/approved-spec.md --key change-2026-10-11
-npm run cli -- --socket /srv/appdata/berry/state/services/software-factory/api.sock status JOB_ID
-npm run cli -- --socket /srv/appdata/berry/state/services/software-factory/api.sock cancel JOB_ID
+berry-afk run --config /path/to/project.json --spec /path/to/approved-spec.md --flow build --output /srv/appdata/berry/state/services/software-factory/runs
+berry-afk status /path/to/run
+berry-afk cancel /path/to/run
 ```
 
-Any coding agent can invoke the same CLI through SSH. Copy the approved spec to the host, then run:
+`run` stays in the foreground and prints its unique run directory before executing the pipeline. `--output` selects the parent for new run directories, not a reusable run ID. Without it, evidence goes under the repository's Git common directory. Status and cancellation take the exact printed run directory. Cancellation requests affect only that instance. Retained work and evidence remain available after success or failure.
+
+For `review-repair` or `review-only`, supply `--baseline FULL_40_CHARACTER_COMMIT_SHA`, an ancestor of current HEAD. Both flows inspect an isolated retained worktree. Review-only dispatches no implementer or repairer. Reviewer/check source writes invalidate the result.
+
+### AFK on gl502
+
+Each invocation can have its own transient systemd unit. This unit supervises one process; it does not dispatch other jobs. A unique unit name permits overlapping runs and survives SSH logout when user lingering is enabled:
 
 ```sh
-ssh berry@gl502 '/home/berry/.local/bin/berry-afk submit --repository example --flow build --spec /tmp/approved-spec.md --key unique-request-key'
+unit="factory-$(date +%s)-$(cat /proc/sys/kernel/random/uuid)"
+systemd-run --user --unit="$unit" --collect --property=UMask=0077 --property=KillMode=control-group \
+  /home/berry/.local/bin/berry-afk run \
+  --config /path/to/project.json --spec /path/to/approved-spec.md --flow build \
+  --output /srv/appdata/berry/state/services/software-factory/runs
+journalctl --user -u "$unit" -o cat
 ```
 
-For `review-repair` or `review-only`, add `--baseline FULL_40_CHARACTER_COMMIT_SHA`. The base must be an ancestor of current HEAD. Both flows inspect a retained isolated worktree. `review-only` dispatches no implementer or repairer. A reviewer or check source write causes an incomplete result. The original checkout never receives automatic merges or deployments. Successful output identifies a retained branch and worktree.
+Use the printed run directory with `status` and `cancel`. Launching another unit starts another independent run immediately. Machine capacity and provider limits still apply; independence does not guarantee unchanged latency under load.
 
-## Gates and recovery
+## Pipeline and gates
 
-The planner derives observable acceptance from the spec, then returns typed small tickets and an acyclic dependency graph. TDD guides implementation; historical process proof is not added to product acceptance. Unknown dependencies, duplicate IDs, malformed outputs and blockers stop work. Ready tickets can run concurrently; integration runs serially. Ticket review judges only its assigned product scope. Operating constraints are recorded separately for the controller. Final review judges the combined product spec and receives current original HEAD/source and output branch evidence. The controller has no push or deploy step. Host noSandbox execution cannot attest unobserved historical external agent actions. Each review is a fresh session with only spec, standards, pinned baseline, source and check evidence. It receives no implementation conversation or earlier review. Repairs receive actual findings and check failures. All scoped acceptance criteria need observed evidence; pending coverage prevents completion.
+The planner derives observable acceptance and small tickets with an acyclic dependency graph. Ready tickets run concurrently within the configured limit. Each ticket gets a worktree and fresh implementer. Its dependencies integrate before downstream work. Integration is ordered inside that run. Unknown dependencies, duplicate IDs, malformed output and blockers stop execution.
 
-SQLite WAL transactions preserve immutable input/config snapshots, claims, cancellation, attempts and events. Check evidence records exact source hashes and bounded output. Source fingerprints include names, modes, bytes, symlink targets and deleted files. Read-only checks, planners and reviewers also compare retained Git HEAD, current branch and full staged index entries. Source or Git state changes invalidate the evidence. These checks detect observable retained state; noSandbox does not physically prevent writes or attest past actions. Repair progress still requires a source change; an empty commit does not count. Zero findings alone cannot override a failed check. Repeated source state, no source progress, timeout, cancellation and round budgets remain incomplete. Restart marks interrupted jobs incomplete and retains their prior evidence. There is no automatic lucky retry. To continue, inspect retained work, resolve the cause and submit a new approved request with a new key. Cancellation wins over late completion.
+Each review receives spec, standards, pinned baseline, source and check evidence. It receives no implementation conversation or earlier review. Repairs receive findings and check failures. Ticket review covers the assigned product scope; final review covers the combined product spec. Completion requires zero findings, passing checks and verified acceptance for every scoped criterion. Review-only can report findings as incomplete; it does not silently approve them.
 
-The socket and database use owner-only permissions. Runtime tool logs and captured sessions are disabled. Check output redacts common token/password patterns; use credential-free checks, since arbitrary program output cannot be guaranteed secret-free. Do not submit credentials in specs. Submission/status data belongs in protected state.
+Evidence includes source hashes, bounded check output and retained Git state. Read-only checks, planners and reviewers compare source plus HEAD, branch and staged index. Publication retains the exact accepted source and Git state. These checks detect observable changes; unrestricted host execution can still edit files. The pipeline has no push or deploy step and cannot attest unobserved historical external actions.
 
-Deployment scripts are in [deploy/](deploy/). Source, configuration, mutable state and sockets have distinct Berry `/srv/appdata` locations. Retained worktrees and evidence are kept for inspection; cleanup is an operator action. No host setup or live execution occurs during default tests.
+No source progress, repeated source, timeout, cancellation and round limits leave the run incomplete. An integration conflict also stops incomplete. Inspect retained work and resolve the cause before a new approved run. There is no automatic resume or lucky retry. A crash does not authorize completion.
 
-## Sources and adaptations
+## Runtime and verification
 
-Ticket graphs and fresh implementation contexts follow [Matt Pocock's to-tickets](https://github.com/mattpocock/skills/tree/main/skills/engineering/to-tickets) and [implement-spec](https://github.com/mattpocock/skills/tree/main/skills/engineering/implement-spec). The two review axes follow [code-review](https://github.com/mattpocock/skills/tree/main/skills/engineering/code-review). Agent/worktree execution uses [Sandcastle](https://github.com/mattpocock/sandcastle). These are structural patterns. This implementation uses a local durable queue, typed outputs and measured gates. It does not copy GitHub issue plumbing or text-based completion heuristics.
+Runs use unique output branches/worktrees. Sandcastle's ignored metadata is shared per repository where required by its API; it does not control scheduling. Do not remove retained worktrees or metadata used by another run. Source, configuration and mutable evidence have separate Berry locations. See [installation and migration](deploy/README.md).
+
+Use Node 26, `npm ci`, `npm run typecheck` and `npm test` in this directory. Default tests use real Git/files and substitute model executables; they need no credentials. These tests verify control flow and process ownership. Live model behaviour needs a separate host check. Tool logs and captured Sandcastle sessions are disabled; provider CLIs can retain their own history. Check output redacts common secret patterns, but arbitrary output cannot be guaranteed secret-free.
+
+## Sources
+
+Ticket graphs and fresh implementation contexts follow [Matt Pocock's to-tickets](https://github.com/mattpocock/skills/tree/main/skills/engineering/to-tickets) and [implement-spec](https://github.com/mattpocock/skills/tree/main/skills/engineering/implement-spec). Review axes follow [code-review](https://github.com/mattpocock/skills/tree/main/skills/engineering/code-review). [Sandcastle](https://github.com/mattpocock/sandcastle) supplies agent/worktree APIs. Berry supplies typed results, measured gates and independent run evidence.

@@ -3,6 +3,15 @@ import { noSandbox } from "@ai-hero/sandcastle/sandboxes/no-sandbox";
 import type { RuntimeConfig } from "./runtime.js";
 import type { AgentRequest } from "./contracts.js";
 
+// A crashed controller closes IPC. Stop this isolated worker group and descendants.
+process.once("disconnect", () => {
+  try {
+    process.kill(-process.pid, "SIGKILL");
+  } finally {
+    process.exit(1);
+  }
+});
+
 // Only the task parent supplies this IPC request. No conversation or sessions
 // are resumed. The parent owns this entire process group and its cancellation.
 process.once(

@@ -14,12 +14,17 @@ import {
   readFile,
   appendFile,
   realpath,
+  mkdtemp,
+  writeFile,
+  rm,
 } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
-import { resolve, join, relative, isAbsolute, dirname } from "node:path";
+import { resolve, join, dirname } from "node:path";
 import type { Runtime, AgentRequest } from "./contracts.js";
 import { Incomplete } from "./contracts.js";
+import { isWithin } from "./source.js";
 
 export interface RuntimeConfig {
   provider?: "codex" | "claude";
@@ -44,7 +49,7 @@ export function createRuntime(config: RuntimeConfig = {}): Runtime {
       await prepareMetadata(
         request.cwd,
         config.stateRoot ??
-          "/srv/appdata/berry/state/services/software-factory",
+          join(await repositoryStateRoot(request.cwd), "metadata"),
       );
       return executeWorker({ ...config, provider, model }, request);
     },
@@ -58,8 +63,7 @@ export function createRuntime(config: RuntimeConfig = {}): Runtime {
       try {
         await prepareMetadata(
           repo,
-          config.stateRoot ??
-            "/srv/appdata/berry/state/services/software-factory",
+          config.stateRoot ?? join(await repositoryStateRoot(repo), "metadata"),
         );
         const handle = await sandcastleWorktree({
           cwd: resolve(repo),
@@ -86,35 +90,19 @@ export function createRuntime(config: RuntimeConfig = {}): Runtime {
   };
 }
 
+export async function repositoryStateRoot(repo: string): Promise<string> {
+  const { stdout } = await promisify(execFile)(
+    "git",
+    ["rev-parse", "--git-common-dir"],
+    { cwd: repo },
+  );
+  return join(await realpath(resolve(repo, stdout.trim())), "berry-afk");
+}
+
 async function prepareMetadata(repo: string, root: string): Promise<void> {
   const canonical = await realpath(repo),
     metadataRoot = resolve(root);
-  const nested = relative(metadataRoot, canonical);
-  if (nested && !nested.startsWith("..") && !isAbsolute(nested)) return;
-  const id = createHash("sha256").update(canonical).digest("hex");
-  const sandcastle = join(canonical, ".sandcastle");
-  await mkdir(sandcastle, { recursive: true });
-  if ((await lstat(sandcastle)).isSymbolicLink())
-    throw new Incomplete("Foreign Sandcastle metadata directory");
-  for (const name of ["worktrees", "logs", "patches"]) {
-    const target = join(metadataRoot, name, id),
-      link = join(sandcastle, name);
-    await mkdir(target, { recursive: true, mode: 0o700 });
-    try {
-      const existing = await lstat(link);
-      if (
-        !existing.isSymbolicLink() ||
-        resolve(dirname(link), await readlink(link)) !== target
-      ) {
-        throw new Incomplete(
-          "Existing Sandcastle metadata path requires operator review",
-        );
-      }
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      await symlink(target, link, "dir");
-    }
-  }
+  if (isWithin(metadataRoot, canonical)) return;
   // Local Git excludes do not alter tracked source or existing Sandcastle config.
   const git = promisify(execFile);
   const { stdout } = await git(
@@ -137,6 +125,43 @@ async function prepareMetadata(repo: string, root: string): Promise<void> {
     await appendFile(exclude, "\n" + missing.join("\n") + "\n", {
       mode: 0o600,
     });
+  const id = createHash("sha256").update(canonical).digest("hex");
+  const sandcastle = join(canonical, ".sandcastle");
+  await mkdir(sandcastle, { recursive: true });
+  if ((await lstat(sandcastle)).isSymbolicLink())
+    throw new Incomplete("Foreign Sandcastle metadata directory");
+  for (const name of ["worktrees", "logs", "patches"]) {
+    const target = join(metadataRoot, name, id),
+      link = join(sandcastle, name);
+    await mkdir(target, { recursive: true, mode: 0o700 });
+    try {
+      const existing = await lstat(link);
+      if (
+        !existing.isSymbolicLink() ||
+        resolve(dirname(link), await readlink(link)) !== target
+      ) {
+        throw new Incomplete(
+          "Existing Sandcastle metadata path requires operator review",
+        );
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      try {
+        await symlink(target, link, "dir");
+      } catch (creationError) {
+        if ((creationError as NodeJS.ErrnoException).code !== "EEXIST")
+          throw creationError;
+        // A concurrent run may have created the same stable link.
+        if (
+          !(await lstat(link)).isSymbolicLink() ||
+          resolve(dirname(link), await readlink(link)) !== target
+        )
+          throw new Incomplete(
+            "Existing Sandcastle metadata path requires operator review",
+          );
+      }
+    }
+  }
 }
 
 /** The task process group contains Sandcastle and its host CLI descendants. */
@@ -145,12 +170,35 @@ async function executeWorker(
   request: AgentRequest,
 ): Promise<string> {
   request.signal?.throwIfAborted();
-  return new Promise((done, reject) => {
+  // Sandcastle writes global Git setup. Give each worker its own writable layer,
+  // including the user's configuration without modifying or locking that file.
+  const gitDirectory = await mkdtemp(join(tmpdir(), "berry-afk-git-"));
+  const gitConfig = join(gitDirectory, "config");
+  const inherited =
+    process.env.GIT_CONFIG_GLOBAL !== undefined
+      ? [process.env.GIT_CONFIG_GLOBAL].filter(Boolean)
+      : [
+          join(
+            process.env.XDG_CONFIG_HOME ?? join(homedir(), ".config"),
+            "git",
+            "config",
+          ),
+          join(homedir(), ".gitconfig"),
+        ];
+  await writeFile(
+    gitConfig,
+    inherited
+      .map((path) => `[include]\n\tpath = ${JSON.stringify(resolve(path))}\n`)
+      .join(""),
+    { mode: 0o600 },
+  );
+  return new Promise<string>((done, reject) => {
     const child = fork(
       fileURLToPath(new URL("./runtime-worker.ts", import.meta.url)),
       [],
       {
         detached: true,
+        env: { ...process.env, GIT_CONFIG_GLOBAL: gitConfig },
         stdio: ["ignore", "ignore", "ignore", "ipc"],
         execArgv: ["--import", fileURLToPath(import.meta.resolve("tsx"))],
       },
@@ -238,5 +286,5 @@ async function executeWorker(
       },
     );
     if (request.signal?.aborted) abort();
-  });
+  }).finally(() => rm(gitDirectory, { recursive: true, force: true }));
 }

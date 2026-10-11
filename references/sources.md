@@ -75,7 +75,7 @@ Treat prompts, skills, files, memory and tools as one context system. Conflicts 
 
 ## Deliberate limits and extension point
 
-This version runs on demand in a Git project. The controller dispatches work and checks in a fixed order; agents still make fallible implementation and review decisions. Project commands and acceptance scenarios remain local. Model choices remain unchanged. Claude workers use the owner's explicitly requested permission-bypass flag, documented in [runner.md](runner.md); Codex retains its configured policy. Nothing in a source grants permission to deploy, publish, message others, or widen a task.
+This version runs as a Berry queue job on a registered Git repository. The Berry queue dispatches work and checks in a fixed order; agents still make fallible implementation and review decisions. Project commands and acceptance scenarios remain local. Model choices remain unchanged. Workers run on the host with Sandcastle `noSandbox()`, an explicit deployment choice; this is not a security sandbox. Nothing in a source grants permission to deploy, publish, message others, or widen a task.
 
 A worker adapter separates model access from the loop. A future Berry LLM Gateway adapter must follow the live Gateway contract and identity rules in `berry-llm-gateway`; a model endpoint alone does not provide a coding agent's filesystem and tool execution loop. Future unattended scheduling also needs an explicit execution and spending policy. Neither is silently enabled here.
 
@@ -83,8 +83,8 @@ A worker adapter separates model access from the loop. A future Berry LLM Gatewa
 
 [OpenAI: Build iterative repair loops with Codex](https://developers.openai.com/cookbook/examples/codex/build_iterative_repair_loops_with_codex) separates read-only review, focused repair, and executable validation. Remaining failures feed the next repair; records preserve findings, edits, results, and unresolved issues. Its continuous-loop guidance includes validation success, attempt limits, unchanged failures, and decisions needing human review.
 
-For this factory, the user chose fresh reviewer sessions and repair until no findings remain. The default has no attempt-count cap, while time limits and no-progress stops still return incomplete. Fresh reviewers receive source and check evidence without prior review conclusions. These are local choices, not a claim that the cookbook guarantees unbiased review or bug-free code.
+For this factory, the user chose fresh reviewer sessions and repair until no findings remain. The queue bounds repair rounds per registered repository, and limits, timeouts and no-progress stops return incomplete. Fresh reviewers receive source and check evidence without prior review conclusions. These are local choices, not a claim that the cookbook guarantees unbiased review or bug-free code.
 
-## Isolated execution extension
+## Isolated execution
 
-The installed `ask-matt` remains the routing source. The installed `implement-spec` supplied the design reference: ready graph frontiers, one branch/worktree per task, integration before dependencies, conflict repair, and final combined review. This runner enforces those mechanics with stable bounded batches and fresh CLI processes. It retains failed worktrees instead of removing useful failure evidence. Product choices and explicit deferrals remain human decisions. These are local engineering choices, not external standards. Matt’s catalogue is installed separately and is not bundled or automatically synchronized here.
+The installed `ask-matt` remains the routing source. The installed `implement-spec` supplied the design reference: ready graph frontiers, one branch/worktree per task, integration before dependencies, conflict repair, and final combined review. The Berry queue applies those mechanics with ready batches and fresh sessions. It retains failed worktrees instead of removing useful failure evidence. Product choices and explicit deferrals remain human decisions. These are local engineering choices, not external standards. Matt’s catalogue is installed separately and is not bundled or automatically synchronized here.

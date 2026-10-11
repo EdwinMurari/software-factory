@@ -1,6 +1,6 @@
 # Berry AFK queue
 
-This opt-in service runs approved specs without an interactive session. It preserves the Python factory. It uses pinned `@ai-hero/sandcastle` 0.12.0 for isolated worktrees and fresh Codex or Claude sessions with `noSandbox()`. Host execution is an explicit deployment choice. The default adapter is Codex `gpt-6-astra`; the service requires an explicit provider and model in each registered repository configuration.
+This opt-in service runs approved specs without an interactive session. It uses pinned `@ai-hero/sandcastle` 0.12.0 for isolated worktrees and fresh Codex or Claude sessions with `noSandbox()`. Host execution is an explicit deployment choice. The default adapter is Codex `gpt-6-astra`; the service requires an explicit provider and model in each registered repository configuration.
 
 Node 26 is required for `node:sqlite`. Install with `npm ci`, run `npm run typecheck` and `npm test` in `afk/`. Default tests need no model credentials. They use real SQLite, files and Git. The runtime fixture exercises the real Sandcastle package with a disposable fake executable. Live model evidence is a separate host check.
 

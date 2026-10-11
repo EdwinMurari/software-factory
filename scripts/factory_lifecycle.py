@@ -42,7 +42,7 @@ def finish_claim(owner):
         return
     for path in registry_paths(owner):
         atomic(path, {'run_id': owner.run_id, 'report': str(owner.output / 'report.json'),
-                      'state': 'complete' if owner.report['status'] == 'verified' else 'active'})
+                      'state': 'complete' if owner.report['status'] in ('verified', 'reviewed') else 'active'})
 
 
 def known_worktrees(report):
@@ -163,6 +163,8 @@ def finish_adoption(owner, adoption):
 def prepare_operation(owner, action, reason, findings):
     if owner.investigate:
         return
+    if owner.review_only and action in ('adopt', 'reopen'):
+        raise FactoryError('Review-only cannot adopt source edits or request repairs; register a new approved plan')
     if owner.resuming:
         references_unchanged(owner.report['dependencies'] + owner.report.get('evidence_files', []))
         require_workers_stopped(owner.output)
@@ -209,7 +211,7 @@ def prepare_operation(owner, action, reason, findings):
         owner.save()
 
 
-def validate_verification(session, plan, tickets, expected_inputs=None):
+def validate_verification(session, plan, tickets, expected_inputs=None, review_only=False):
     """Check coverage, process evidence, exact input binding and zero findings."""
     required = set(plan['integration_checks']) | {c for t in tickets for c in t['checks']}
     checks = session['final_checks']
@@ -222,14 +224,15 @@ def validate_verification(session, plan, tickets, expected_inputs=None):
         for field in ('stdout', 'stderr'):
             Path(check[field]).read_bytes()
         definition = check_map[check['check_id']]
-        if (check['status'] != 'passed' or check['exit_code'] != 0
+        valid_exit = (check['status'] == 'passed' and check['exit_code'] == 0) or (review_only and check['status'] == 'failed' and check['exit_code'] != 0)
+        if (not valid_exit
                 or check['argv'] != definition['argv'] or check['repo'] != definition['repo']
                 or check['inputs_sha256'] != fingerprint or check['after_inputs_sha256'] != fingerprint):
             raise FactoryError('Failed or stale required check evidence')
         if not any(all(p.get(k) == check.get(k) for k in ('argv', 'phase', 'stdout', 'stderr', 'inputs_sha256', 'after_inputs_sha256', 'status', 'exit_code')) for p in processes):
             raise FactoryError('Required check process evidence missing')
     review = validate_result(session['final_review'], [a['id'] for t in tickets for a in t['acceptance']])
-    if not Controller.review_complete(review):
+    if (review_only and review['status'] not in ('complete', 'changes_requested')) or (not review_only and not Controller.review_complete(review)):
         raise FactoryError('Review has unresolved findings or pending acceptance')
     reviews = [p for p in processes if p['phase'] == 'final_review' and p.get('result') == review]
     if reviews:
@@ -243,7 +246,7 @@ def complete(path):
     from factory_v2 import load_plan, controller_hash, repository_inputs
     path = Path(path).resolve()
     report = read_json(path)
-    if report['version'] != 2 or report['mode'] != 'build':
+    if report['version'] != 2 or report['mode'] not in ('build', 'review'):
         raise FactoryError('Completion requires a v2 build report')
     plan, sources, plan_hash, _ = load_plan(Path(report['plan_path']))
     if plan_hash != report['plan_sha256'] or controller_hash() != report['controller_sha256']:
@@ -270,7 +273,7 @@ def complete(path):
     if {r['path'] for r in manifests} != expected_files:
         raise FactoryError('Incomplete evidence manifest')
     references_unchanged(plan['_dependencies'] + manifests)
-    for ticket in plan['tickets']:
+    for ticket in ([] if report['mode'] == 'review' else plan['tickets']):
         state = report['tickets'][ticket['id']]
         if state['status'] != 'integrated':
             raise FactoryError('Task is not integrated: ' + ticket['id'])
@@ -286,23 +289,43 @@ def complete(path):
     if exact != report['final_inputs']:
         raise FactoryError('Integration changed after validation')
     final = read_json(path.parent / 'final' / 'report.json')
-    validate_verification(final, plan, plan['tickets'], digest(encoded(exact)))
+    review_only = report['mode'] == 'review' and plan['input'].get('review_only', False)
+    if report['mode'] == 'review':
+        if report.get('comparison_baselines') != plan['input']['baselines'] or report.get('review_only') != review_only:
+            raise FactoryError('Review mode or comparison baseline changed')
+        if {name: value['head'] for name, value in final['baseline'].items()} != plan['input']['baselines']:
+            raise FactoryError('Final review comparison differs from pinned baseline')
+        if report.get('integration_attempts') != final.get('integration_attempts') or report.get('final_processes') != final['processes']:
+            raise FactoryError('Review attempt or process summaries differ from saved evidence')
+        if any(value['inputs_sha256'] != report['source_inputs'][name] or value['untracked'] or Path(value['tracked_patch']).read_bytes()
+               for name, value in final['baseline'].items()):
+            raise FactoryError('Review starting input or comparison patch changed')
+        if review_only:
+            if any('repair' in p['phase'] or p['phase'].startswith('implement') or p['phase'] == 'git-commit' for p in final['processes']):
+                raise FactoryError('Review-only contains source mutation dispatch')
+            if exact != report['source_inputs']:
+                raise FactoryError('Review-only source copy changed')
+    validate_verification(final, plan, plan['tickets'], digest(encoded(exact)), review_only=review_only)
     if report['final_checks'] != final['final_checks'] or report['final_review'] != final['final_review']:
         raise FactoryError('Final evidence differs from saved session')
     if any(a.get('status') == 'pending' for a in report.get('adoptions', [])):
         raise FactoryError('Unfinished adoption; continue its retained operation')
     if any(not f['resolved'] for f in report.get('findings', [])):
         raise FactoryError('Unresolved late findings')
-    if report['status'] != 'verified':
+    expected_status = 'reviewed' if review_only else 'verified'
+    if report['status'] != expected_status:
         raise FactoryError('Run has not reached completion')
-    return {'status': 'verified', 'fresh': True, 'run_id': report['run_id'], 'report': str(path), 'claim': report['claim']}
+    result = {'status': expected_status, 'fresh': True, 'run_id': report['run_id'], 'report': str(path), 'claim': report['claim']}
+    if review_only:
+        result.update(verified=False, issues=final['final_review']['issues'], check_failures=[c['check_id'] for c in final['final_checks'] if c['status'] == 'failed'], limitations=['Product compliance is unverified: no spec supplied'] if plan['spec'] is None else [])
+    return result
 
 
 def close_run(path, reason):
     """Explicitly end ownership without certifying or discarding incomplete work."""
     text(reason, 'closure reason')
     report = read_json(path)
-    if report.get('version') != 2 or report.get('mode') != 'build':
+    if report.get('version') != 2 or report.get('mode') not in ('build', 'review'):
         raise FactoryError('Closing requires a v2 build report')
     lock_paths = [Path(value) for value in report['lock_paths']]
     claims = [Path(value) for value in report['registry_paths']]
@@ -344,7 +367,7 @@ def operate(path, action, reason=None, findings=None):
     if action == 'close':
         return close_run(path, reason)
     report = read_json(path)
-    if report.get('version') != 2 or report.get('mode') != 'build':
+    if report.get('version') != 2 or report.get('mode') not in ('build', 'review'):
         raise FactoryError('Lifecycle operations require a v2 build report')
     if report['status'] == 'closed':
         raise FactoryError('Run is closed; register a new approved plan')
@@ -360,4 +383,7 @@ def operate(path, action, reason=None, findings=None):
                 fcntl.flock(stream, fcntl.LOCK_UN)
                 stream.close()
     result = owner.run(action, reason, findings)
-    return {'status': result['status'], 'reason': result.get('reason'), 'run_id': owner.run_id, 'report': str(path)}
+    response = {'status': result['status'], 'reason': result.get('reason'), 'run_id': owner.run_id, 'report': str(path)}
+    if result['status'] == 'reviewed':
+        response.update(complete(path))
+    return response

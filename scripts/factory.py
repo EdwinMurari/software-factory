@@ -103,9 +103,9 @@ def positive(value, name, maximum=86400):
         raise FactoryError(f"{name} must be positive and at most {maximum}")
 
 
-def git(project, *args):
+def git(project, *args, env=None):
     try:
-        result = subprocess.run(["git", "-C", str(project), *args], capture_output=True, timeout=30)
+        result = subprocess.run(["git", "-C", str(project), *args], capture_output=True, timeout=30, env=env)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise FactoryError(f"Git unavailable: {exc}") from exc
     if result.returncode:
@@ -119,34 +119,61 @@ def repository_lock_path(project):
     return Path(tempfile.gettempdir()) / f"software-factory-{os.getuid()}-{digest(os.fsencode(directory))[:24]}.lock"
 
 
-def snapshot(project):
+def index_flags(project, *, git_env=None):
+    """Read semantic index flags without hashing volatile stat-cache data."""
+    remaining = git(project, "ls-files", "--debug", "-z", env=git_env)
+    flags = []
+    while remaining:
+        path, remaining = remaining.split(b"\0", 1)
+        # Git emits five stat-cache lines after each NUL-terminated path.
+        *metadata, remaining = remaining.split(b"\n", 5)
+        value = int(metadata[-1].split(b"flags: ", 1)[1], 16)
+        value &= 0x60008000  # intent-to-add, skip-worktree, assume-unchanged
+        if value:
+            flags.append([os.fsdecode(path), value])
+    return flags
+
+
+def snapshot(project, content_only=False, *, git_env=None):
     """Hash index entries, HEAD and all tracked/nonignored worktree inputs.
 
     Ignored and external inputs are deliberately outside this contract. Symlink
     text is hashed, not its external target. Submodules are unsupported.
     """
-    index = git(project, "ls-files", "--stage", "-z")
+    index = git(project, "ls-files", "--stage", "-z", env=git_env)
     if any(entry.startswith(b"160000 ") for entry in index.split(b"\0")):
         raise FactoryError("Git submodules are unsupported")
-    head = git(project, "rev-parse", "--verify", "HEAD")
-    paths = set(git(project, "ls-files", "--cached", "--others", "--exclude-standard", "-z").split(b"\0"))
+    head = git(project, "rev-parse", "--verify", "HEAD", env=git_env)
+    paths = set(git(project, "ls-files", "--cached", "--others", "--exclude-standard", "-z", env=git_env).split(b"\0"))
     records = []
     for raw in sorted(paths - {b""}):
         path = Path(project) / os.fsdecode(raw)
         try:
+            # An indexed file replaced by a directory is deleted in the worktree.
+            # Its listed children are separate inputs. A replaced parent also
+            # deletes old descendants; never follow a symlink to external files.
+            if any((Path(project) / parent).is_symlink()
+                   for parent in Path(os.fsdecode(raw)).parents):
+                raise FileNotFoundError(path)
             info = path.lstat()
             if stat.S_ISLNK(info.st_mode):
                 content = os.fsencode(os.readlink(path))
             elif stat.S_ISREG(info.st_mode):
                 content = path.read_bytes()
+            elif stat.S_ISDIR(info.st_mode):
+                raise FileNotFoundError(path)
             else:
                 raise FactoryError(f"Unsupported source input: {path}")
-            records.append([os.fsdecode(raw), stat.S_IMODE(info.st_mode), digest(content)])
-        except FileNotFoundError:
-            records.append([os.fsdecode(raw), "deleted"])
+            records.append([os.fsdecode(raw), stat.S_IFMT(info.st_mode), stat.S_IMODE(info.st_mode), digest(content)])
+        except (FileNotFoundError, NotADirectoryError):
+            # Missing index paths disappear when the controller commits existing
+            # dirt. That changes input evidence, but is not a source edit.
+            if not content_only:
+                records.append([os.fsdecode(raw), "deleted"])
         except OSError as exc:
             raise FactoryError(f"Cannot fingerprint {path}: {exc}") from exc
-    return digest(encoded({"head": head.decode().strip(), "index": digest(index), "files": records}))
+    return digest(encoded(records if content_only else {"head": head.decode().strip(), "index": digest(index),
+                                                       "index_flags": index_flags(project, git_env=git_env), "files": records}))
 
 
 def load_plan(path):
@@ -493,6 +520,16 @@ class Controller:
             ),
         }
         request.update(self.worker_context(phase, ticket))
+        if self.plan.get("input", {}).get("kind") == "review" and "review" in phase:
+            request["instructions"] += (
+                " This is a review of existing work. Inspect the whole scoped change from the explicit comparison "
+                "baseline, including committed and working changes that predate this run; these are review inputs.")
+            if self.plan["input"].get("review_only", False):
+                request["instructions"] += (
+                    " Report-only inspection permits findings and pending product criteria. Use changes_requested "
+                    "for concrete defects. A missing product spec is an explicit limitation: mark affected criteria "
+                    "pending and report the available code findings; do not invent approval or block solely for this "
+                    "missing spec. Other actual blockers still require blocked. Do not repair or commit source.")
         return self.invoke(request, phase + ("-" + ticket["id"] if ticket else ""),
                            RESULT_SCHEMA, lambda value: validate_result(value, [a["id"] for a in acceptance]),
                            readonly="review" in phase)
@@ -699,7 +736,11 @@ class Controller:
         raise FactoryError(f"Ticket {ticket['id']} exhausted its bounded attempts")
 
     def verify_integration(self, findings=None):
+        if self.report.get("integration_validation_stop"):
+            raise FactoryError(self.report["integration_validation_stop"])
         required = [c for tid in self.order for c in self.tickets[tid]["checks"]]
+        review_existing = self.plan.get("input", {}).get("kind") == "review"
+        review_only = self.plan.get("input", {}).get("review_only", False)
         self.report.setdefault("integration_attempts", [])
         seen = set(self.report.get("integration_progress_inputs", []))
         evidence = []
@@ -717,6 +758,7 @@ class Controller:
             # after interruption. Unchanged findings still require a repair.
             if checkpoint["progress"] == self.progress():
                 evidence = findings
+        resume_initial_review = None
         previous = self.report["integration_attempts"][-1] if self.report["integration_attempts"] else None
         if previous:
             self.recover_validation(previous, required + self.plan["integration_checks"], "final_review")
@@ -725,47 +767,97 @@ class Controller:
             # another source mutation when the failure describes today's inputs.
             current = self.inputs()
             same_inputs = checks and all(c.get("inputs_sha256") == current for c in checks)
-            if same_inputs and review and review["status"] == "changes_requested":
+            if same_inputs and review_only and any(c["status"] == "failed" for c in checks):
+                resume_initial_review = previous
+            elif same_inputs and review and review["status"] == "changes_requested":
                 evidence += [{"review": review, "checks": self.failure_evidence(checks)}]
             elif same_inputs and any(c["status"] == "failed" for c in checks):
-                evidence += self.failure_evidence(checks)
+                if review_existing and review is None:
+                    # The check process can be saved before its attempt or
+                    # review handoff. Review that retained failure first; a
+                    # lucky rerun must not replace it before a source repair.
+                    resume_initial_review = previous
+                else:
+                    evidence += self.failure_evidence(checks)
+        if review_only:
+            evidence = []
+        if review_only and self.report.get("pending_source_worker"):
+            raise FactoryError("Review-only cannot resume a source worker")
         for attempt in self.attempts():
             before = self.progress()
             pending = self.report.get("pending_source_worker")
             if attempt or evidence or (pending and pending["label"] == "integration_repair"):
+                if review_only:
+                    raise FactoryError("Review-only cannot dispatch repair")
                 repair, before = self.source_worker("integration_repair", None, evidence)
                 if repair["status"] == "blocked":
-                    raise FactoryError("Integration repair blocked: " + repair["summary"])
+                    message = "Integration repair blocked: " + repair["summary"]
+                    if self.plan.get("input", {}).get("kind") == "review":
+                        self.report["integration_validation_stop"] = message
+                        self.save()
+                    raise FactoryError(message)
                 after = self.progress()
                 if after == before or after in seen:
                     self.report["integration_no_progress_stop"] = {"progress": after}
                     self.report.pop("pending_source_worker", None)
                     self.save()
                     raise FactoryError("Integration repair made no source progress; stopped")
-            progress = self.progress()
-            entry = {"number": len(self.report["integration_attempts"]) + 1, "checks": [], "review": None,
-                     "validation_process_index": len(self.report["processes"])}
-            self.report["integration_attempts"].append(entry)
-            seen.add(progress)
-            self.report["integration_progress_inputs"] = sorted(seen)
-            self.report.pop("pending_source_worker", None)
-            self.save()
-            checks = self.run_checks(required + self.plan["integration_checks"])
+            if (attempt == 0 and resume_initial_review is not None and not evidence
+                    and not (pending and pending["label"] == "integration_repair")):
+                entry = resume_initial_review
+                checks = entry["checks"]
+                if review_only and all(c["status"] in ("passed", "failed") for c in checks):
+                    completed = {c["check_id"] for c in checks}
+                    missing = [cid for cid in dict.fromkeys(required + self.plan["integration_checks"])
+                               if cid not in completed]
+                    if missing:
+                        # Retain failed evidence. An interrupted report-only
+                        # check batch still owes its remaining checks and review.
+                        entry["review"] = None
+                        checks = checks + self.run_checks(missing)
+            else:
+                progress = self.progress()
+                entry = {"number": len(self.report["integration_attempts"]) + 1, "checks": [], "review": None,
+                         "validation_process_index": len(self.report["processes"])}
+                self.report["integration_attempts"].append(entry)
+                seen.add(progress)
+                self.report["integration_progress_inputs"] = sorted(seen)
+                self.report.pop("pending_source_worker", None)
+                self.save()
+                checks = self.run_checks(required + self.plan["integration_checks"])
             entry["checks"] = self.report["final_checks"] = checks
             self.save()
             if any(c["status"] not in ("passed", "failed") for c in checks):
-                raise FactoryError("Final check interrupted, unavailable or changed source")
-            if not all(c["status"] == "passed" for c in checks):
+                message = "Final check interrupted, unavailable or changed source; retained evidence is incomplete"
+                if self.plan.get("input", {}).get("kind") == "review":
+                    self.report["integration_validation_stop"] = message
+                    self.save()
+                raise FactoryError(message)
+            checks_passed = all(c["status"] == "passed" for c in checks)
+            if not checks_passed and not review_only and not review_existing:
                 evidence = self.failure_evidence(checks)
                 continue
-            review = self.worker("final_review", None, self.failure_evidence(checks))
+            try:
+                review = entry.get("review") or self.worker("final_review", None, self.failure_evidence(checks))
+            except FactoryError as exc:
+                if self.plan.get("input", {}).get("kind") == "review":
+                    self.report["integration_validation_stop"] = str(exc)
+                    self.save()
+                raise
             entry["review"] = self.report["final_review"] = review
             self.save()
-            if self.review_complete(review):
+            if review_only and review["status"] != "blocked":
                 break
-            if review["status"] != "changes_requested":
-                raise FactoryError("Final review blocked or acceptance remains pending")
-            evidence = [{"review": review, "checks": self.failure_evidence(checks)}]
+            if self.review_complete(review) and checks_passed:
+                break
+            if not self.review_complete(review) and review["status"] != "changes_requested":
+                message = "Final review blocked or acceptance remains pending"
+                if self.plan.get("input", {}).get("kind") == "review":
+                    self.report["integration_validation_stop"] = message
+                    self.save()
+                raise FactoryError(message)
+            evidence = ([{"review": review, "checks": self.failure_evidence(checks)}]
+                        if review["status"] == "changes_requested" else self.failure_evidence(checks))
         else:
             raise FactoryError("Integration exhausted its bounded attempts")
 
@@ -874,8 +966,11 @@ def main(argv=None):
             report = controller.run(action="register") if args.command == "register" else controller.run()
             result = {"status": report["status"], "reason": report.get("reason"),
                       "report": str(controller.output / "report.json"), "claim": report["claim"]}
+            if report["status"] == "reviewed":
+                from factory_lifecycle import complete
+                result.update(complete(controller.output / "report.json"))
         print(json.dumps(result, indent=2))
-        return 0 if result["status"] in ("valid", "verified", "investigated", "registered", "closed") else 1
+        return 0 if result["status"] in ("valid", "verified", "investigated", "registered", "reviewed", "closed") else 1
     except (FactoryError, OSError, KeyError, ValueError) as exc:
         print(json.dumps({"status": "invalid", "reason": str(exc)}, indent=2))
         return 2

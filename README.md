@@ -1,10 +1,16 @@
 # Software Factory
 
-Give Codex or Claude Code either input:
+Give Codex or Claude Code a build, audit, or review request:
 
 > Use the software factory to build [desired product outcome].
 
 > Use the software factory to investigate and improve [audit points and sources].
+
+> Use software factory to review current work against [baseline] and fix findings.
+
+> Review only: use software factory to review current work against [baseline] and report findings without changing code.
+
+Pin the review baseline to a full commit ID. Supply the approved requirements for repairs. If requirements are missing, review only reports that limitation. Material product decisions still need your choice.
 
 You choose product behaviour, one material decision at a time. The agent uses the installed `ask-matt` router for existing skills, records your decisions, and prepares tasks. Investigation findings never approve a change. This repository keeps no second Matt skill catalogue.
 
@@ -40,11 +46,13 @@ python3 scripts/factory.py continue /absolute/path/run/report.json
 python3 scripts/factory.py complete /absolute/path/run/report.json
 ```
 
-`register` records the run before implementation. `continue` restores retained progress; `run` is the compatibility shortcut for both. `reopen REPORT --findings FILE` submits a JSON array of late findings for repair. `adopt REPORT --reason TEXT` records unexplained worktree edits before new checks and fresh review. A different output folder cannot bypass an active run. If the user ends or replaces the agreement, `close REPORT --reason TEXT` preserves its work and evidence, records it as closed without verification, and releases its repository claim.
+`register` records a build or review run before execution. `continue` restores retained progress; `run` is the compatibility shortcut for both. `reopen REPORT --findings FILE` submits a JSON array of late findings for repair. `adopt REPORT --reason TEXT` records unexplained worktree edits before new checks and fresh review. A different output folder cannot bypass an active run. If the user ends or replaces the agreement, `close REPORT --reason TEXT` preserves its work and evidence, records it as closed without verification, and releases its repository claim.
 
 Success requires green checks, every acceptance criterion verified, and zero review issues on the final exact source state. There is no default attempt cap. Time limits, no progress, cancellation, blockers, and stale evidence leave work incomplete. Explicit audit deferrals remain listed separately.
 
-V2 creates local commits and integration branches. It preserves the starting checkout and all failure worktrees. The controller owns commits and merges; a worker changing Git HEAD invalidates its result. The runner does not push, deploy, or close issues. Reports are evidence records, not proof of human identity or bug freedom.
+For existing work, use the [review input schema](references/isolated-runner.md#review-existing-work) with an explicit pinned baseline. Clean and dirty source checkouts are accepted. The default begins with checks and fresh review, repairs scoped findings, and repeats verification. `input.review_only: true` reports findings and failed checks as `reviewed`, with `verified: false` from `complete`/`status`. It performs no repairs or source commits. Both modes preserve the starting checkout, index, working files and file modes.
+
+V2 build and repair create local commits and integration branches. It preserves the starting checkout and all failure worktrees. The controller owns commits and merges; a worker changing Git HEAD invalidates its result. The runner does not push, deploy, or close issues. Reports are evidence records, not proof of human identity or bug freedom.
 
 ## Maintain
 

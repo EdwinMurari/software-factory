@@ -4,7 +4,7 @@ The v2 runner uses Python 3.10+, POSIX and Git. It shares v1’s implementation,
 
 ## Prepare the input
 
-Start with either the desired outcome or the original audit points and their sources. The coordinator reads installed `ask-matt` and uses its selected external skills. This document is execution guidance, not a skill routing catalogue. Use installed `implement-spec` as the orchestration design reference where relevant. The Python runner neither invokes skill flows itself nor interviews the user.
+Start with the desired outcome, original audit points and their sources, or existing work to review. The coordinator reads installed `ask-matt` and uses its selected external skills. This document is execution guidance, not a skill routing catalogue. Use installed `implement-spec` as the orchestration design reference where relevant. The Python runner neither invokes skill flows itself nor interviews the user.
 
 For an audit, `investigate` actually launches a fresh CLI process per point or explicit group. Investigations run sequentially and read current source, including working changes. Each must account for every supplied point, preserve concrete evidence, and report confirmed, disproved or blocked plus any product questions. Source mutations invalidate the investigation. Fingerprints detect changes; they do not prevent them.
 
@@ -176,3 +176,32 @@ Repository locks are stable advisory locks, released on process exit. A persiste
 `complete` is the single build completion gate used by run finalization and verified status. It checks the current integration content, required check coverage and process evidence, all acceptance IDs, fresh zero-finding review, integrated task ancestry, unresolved findings, product decisions, source inputs, plan, controller and evidence dependencies. Changing only a status string cannot satisfy it. The result is the recorded integration worktrees; the original branches are not delivery targets.
 
 These controls detect unsupported edits and stale evidence. They do not restrict filesystem permissions, authenticate reports, attest human approval or prove bug freedom. Ignored files, external symlink targets, hidden adapter state and external services remain outside source fingerprint coverage.
+
+
+## Review existing work
+
+Use the build schema above, but replace `input` with:
+
+```json
+{
+  "kind": "review",
+  "baselines": {"app": "FULL_40_CHARACTER_COMMIT_SHA", "api": "FULL_40_CHARACTER_COMMIT_SHA"},
+  "review_only": false
+}
+```
+
+Resolve each baseline once with `git -C /absolute/path/app rev-parse BASE^{commit}`. Store the full commit SHA in the plan; branch names and moving refs are rejected. The comparison includes committed changes since this baseline plus staged, unstaged, deleted and untracked source. `tickets` define the agreed review/repair scope, acceptance and check set. They are not dispatched for initial implementation. The runner copies the current source index and working files into isolated integration worktrees. It preserves executable permissions and symlinks. Ignored files and external symlink targets remain outside the source fingerprint contract. Checks must have their required dependencies available in the isolated worktree.
+
+```sh
+python3 scripts/factory.py validate /absolute/path/review.json
+python3 scripts/factory.py register /absolute/path/review.json --output-dir /absolute/path/review-run
+python3 scripts/factory.py continue /absolute/path/review-run/report.json
+python3 scripts/factory.py status /absolute/path/review-run/report.json
+python3 scripts/factory.py complete /absolute/path/review-run/report.json
+```
+
+The default performs checks and a fresh read-only review first. Concrete failures dispatch a fresh scoped `integration_repair` worker, then repeat the shared exact-state checks and fresh review to zero findings. It never dispatches initial implementation. Material questions block repair. Budget limits, no source progress and invalid review/check evidence remain incomplete across continuation. `reopen`, `adopt`, `close`, repository ownership and stale evidence gates apply as for builds. The original source checkout remains unchanged; repairs and controlled commits stay in the reported integration worktree.
+
+Set `review_only` to `true` to report without repair or source commits. All required checks run; ordinary failures are passed to the fresh reviewer and listed by `complete` as `check_failures`. Findings remain in `final_review.issues`. A valid report-only result is `reviewed`, never repair completion; `complete` and `status` include `verified: false`, issues and limitations. Mutation, interrupted processes, malformed reviews and stale evidence leave it incomplete. Source adoption and late repair findings are rejected in this mode; close the retained run and register a newly approved plan when its scope changes.
+
+A product agreement is required for default review-and-repair. For report-only work with no spec, keep the field as `"spec": null`, and use `"source": null` for scope tickets that have no referenced task. The request and completion record state that product compliance is unverified. Retain real spec/task references when available. Both Codex and Claude use this same schema and lifecycle; their existing fresh CLI adapters remain unchanged.

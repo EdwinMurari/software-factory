@@ -14,7 +14,7 @@ Pin the review baseline to a full commit ID. Supply the approved requirements fo
 
 You choose product behaviour, one material decision at a time. The agent uses the installed `ask-matt` router for existing skills, records your decisions, and prepares tasks. Investigation findings never approve a change. This repository keeps no second Matt skill catalogue.
 
-Explicit factory requests use the on-demand v2 controller, including one-task changes. Product intake stays in chat. Audits optionally use fresh read-only investigations. The controller builds stable parallel batches in isolated Git worktrees. Dependencies become ready after all participating repositories integrate. Implicit small changes can stay in the current session. Version 1 remains a deliberate legacy interface.
+Explicit AFK requests submit an approved spec to the deployed Berry queue; see the [AFK guide](afk/README.md). Other explicit factory requests use the on-demand v2 controller, including one-task changes. Product intake stays in chat. Audits optionally use fresh read-only investigations. The controller builds stable parallel batches in isolated Git worktrees. Dependencies become ready after all participating repositories integrate. Implicit small changes can stay in the current session. Version 1 remains a deliberate legacy interface.
 
 ![The shared build loop: change, checks, fresh review, repair, and final integrated checks. Intake and v2 scheduling are described in the runner guide.](docs/factory-loop.svg)
 
@@ -22,7 +22,7 @@ The [editable diagram](docs/factory-loop.excalidraw) shows the shared **build lo
 
 ## Install
 
-Use macOS or Linux, Python 3.10+, Git, and an authenticated Codex or Claude Code CLI. Install [Matt Pocock’s skills](https://github.com/mattpocock/skills), including `ask-matt`, separately. Clone this repository to a stable path and link the skill for your client:
+For the on-demand Python controller, use macOS or Linux, Python 3.10+, Git, and an authenticated Codex or Claude Code CLI. Install [Matt Pocock’s skills](https://github.com/mattpocock/skills), including `ask-matt`, separately. Clone this repository to a stable path and link the skill for your client:
 
 ```sh
 git clone git@github.com:EdwinMurari/software-factory.git
@@ -34,9 +34,20 @@ ln -s "$PWD" ~/.claude/skills/software-factory
 
 Inspect an existing destination before replacing it. Start a new client session after installation. This repository was exported from Berry’s skill catalogue at commit `93171ff`. Catalogue links and this checkout do not sync automatically.
 
+For the AFK host service, use Node 26 and follow the [deployment guide](afk/deploy/README.md). Its installer creates the `/home/berry/.local/bin/berry-afk` wrapper. Use the [AFK submit, status and cancel examples](afk/README.md#register-and-run) over SSH. An operator registers each repository root and its trusted checks before submission.
+
 ## Run
 
-Follow the [v2 lifecycle guide and runnable examples](references/isolated-runner.md). The [v1 guide](references/runner.md) covers existing legacy consumers. Plans contain trusted executable commands. Claude workers use the owner-approved `--dangerously-skip-permissions`; Codex keeps its configured policy. The runner detects source mutations and stale evidence but is not a security sandbox.
+For an explicit AFK request, submit the approved spec with the installed host wrapper:
+
+```sh
+ssh gl502 '/home/berry/.local/bin/berry-afk submit --repository REGISTERED_ID --flow build --spec /tmp/approved-spec.md --key STABLE_REQUEST_KEY'
+ssh gl502 '/home/berry/.local/bin/berry-afk status JOB_ID'
+```
+
+Copy the approved spec to the host first. Follow the [AFK guide](afk/README.md) for review flows, cancellation and completion evidence.
+
+For on-demand requests, follow the [v2 lifecycle guide and runnable examples](references/isolated-runner.md). The [v1 guide](references/runner.md) covers existing legacy consumers. Plans contain trusted executable commands. Claude workers use the owner-approved `--dangerously-skip-permissions`; Codex keeps its configured policy. The runner detects source mutations and stale evidence but is not a security sandbox.
 
 ```sh
 python3 scripts/factory.py validate /absolute/path/build.json

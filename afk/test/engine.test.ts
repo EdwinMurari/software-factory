@@ -119,6 +119,7 @@ test("ready graph runs independent tickets and dependent ticket sees combined st
     (step, data) => events.push({ step, data }),
   );
   assert.equal(result.status, "complete");
+  assert.ok(result.checks.every((check) => check.sourceHash === result.sourceHash));
   assert.ok(
     events.some(
       (event) =>
@@ -233,5 +234,60 @@ exec /usr/bin/git "$@"
   } finally {
     clearInterval(watch);
     process.env.PATH = originalPath;
+  }
+});
+
+test("publication rejects source and retained Git changes after final review", async (t) => {
+  for (const mutation of ["source", "branch", "index", "head"]) {
+    await t.test(mutation, async () => {
+      const { root, config } = await fixture();
+      config.checks = [{ id: "content", command: process.execPath,
+        args: ["-e", "process.exit(require('node:fs').readFileSync('base.txt','utf8')==='base'?0:1)"] }];
+      const outside = await mkdtemp(join(tmpdir(), "afk-publish-state-"));
+      const count = join(outside, "count");
+      const marker = join(outside, "mutated");
+      const shim = join(outside, "git");
+      const action = {
+        source: "printf changed > base.txt",
+        branch: "/usr/bin/git checkout -b publication-mutated >/dev/null 2>&1",
+        index: "/usr/bin/git update-index --chmod=+x base.txt",
+        head: "/usr/bin/git -c user.name=T -c user.email=t@t commit --allow-empty -m publication-mutated >/dev/null 2>&1",
+      }[mutation]!;
+      // The first query supplies controller evidence. The second is publication,
+      // after the content check and final read-only review have both passed.
+      await writeFile(shim, `#!/bin/sh
+if [ "$1" = branch ] && [ "$2" = --show-current ]; then
+  if [ -f '${count}' ]; then
+    ${action}
+    touch '${marker}'
+  else
+    touch '${count}'
+  fi
+fi
+exec /usr/bin/git "$@"
+`, { mode: 0o755 });
+      const originalPath = process.env.PATH;
+      let target = "";
+      const checks: { exitCode: number; sourceHash: string }[] = [];
+      process.env.PATH = outside + ":" + originalPath;
+      try {
+        const baseline = (await command(root, "git", ["rev-parse", "HEAD"])).output.trim();
+        await assert.rejects(executeJob(`publication-${mutation}`, "base.txt contains base", "review-only", config,
+          fake(root, async (req) => {
+            target = req.cwd;
+            return JSON.stringify({ findings: [], blockers: [], coverage: [
+              { criterion: "base.txt contains base", evidence: "content check passed", status: "verified" },
+            ] });
+          }), (step, data) => {
+            if (step === "checks") checks.push(...(data as { checks: typeof checks }).checks);
+          }, undefined, baseline), /Publication changed (source|Git state)/);
+        assert.equal(checks.length, 1);
+        assert.equal(checks[0]!.exitCode, 0);
+        assert.equal(await readFile(marker, "utf8"), "");
+        assert.equal(await readFile(join(target, "base.txt"), "utf8"), mutation === "source" ? "changed" : "base");
+      } finally {
+        process.env.PATH = originalPath;
+      }
+    });
   }
 });

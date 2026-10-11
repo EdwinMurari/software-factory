@@ -176,6 +176,16 @@ export async function executeJob(
   if ((await gitState(config.root, signal)) !== registeredGit)
     throw new Incomplete("Registered Git state changed during job");
   const published = await publish(target, signal);
+  // Publication must retain the exact source and Git state accepted by review.
+  // Keep the checked hash authoritative; never replace it with a later sample.
+  const { gitState: reviewedGit, ...verified } = result;
+  if ((await gitState(target, signal)) !== reviewedGit)
+    throw new Incomplete("Publication changed Git state");
+  if (
+    published.sourceHash !== verified.sourceHash ||
+    (await sourceHash(target, signal)) !== verified.sourceHash
+  )
+    throw new Incomplete("Publication changed source");
   signal?.throwIfAborted();
-  return { ...result, ...published };
+  return { ...published, ...verified };
 }

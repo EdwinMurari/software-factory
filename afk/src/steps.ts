@@ -102,6 +102,7 @@ export async function reviewRepair(
             ? "incomplete"
             : "complete",
         sourceHash: before,
+        gitState: reviewerGit,
         checks,
         review,
       };
@@ -110,7 +111,13 @@ export async function reviewRepair(
       checks.every((c) => c.exitCode === 0) &&
       review.coverage.every((c) => c.status === "verified")
     )
-      return { status: "complete", sourceHash: before, checks, review };
+      return {
+        status: "complete",
+        sourceHash: before,
+        gitState: reviewerGit,
+        checks,
+        review,
+      };
     const outcome = parseOutcome(
       await runtime.execute({
         role: "repairer",

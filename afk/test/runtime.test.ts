@@ -107,7 +107,7 @@ test("actual Sandcastle library manages execution, failures and worktrees", asyn
     const pidFile = join(root, "grandchild.pid");
     await writeFile(
       shim,
-      `#!/bin/sh\ncat >/dev/null\nsleep 30 &\necho $! > '${pidFile}'\nwait\n`,
+      `#!/bin/sh\ncat >/dev/null\nsleep 120 &\necho $! > '${pidFile}'\nwait\n`,
       { mode: 0o700 },
     );
     const controller = new AbortController();
@@ -117,16 +117,21 @@ test("actual Sandcastle library manages execution, failures and worktrees", asyn
       cwd: repo,
       signal: controller.signal,
     });
-    const watchdog = setTimeout(() => controller.abort(), 5000);
+    // Observe failures immediately, including before the fixture becomes ready.
+    // Keep the original promise for the cancellation assertion below.
+    void pending.catch(() => {});
+    const watchdog = setTimeout(() => controller.abort(), 60000);
+    const readyDeadline = Date.now() + 60000;
     let grandchild = 0;
     try {
-      for (let i = 0; i < 150; i++) {
+      while (Date.now() < readyDeadline) {
         try {
           grandchild = Number(await readFile(pidFile, "utf8"));
-          break;
-        } catch {
-          await new Promise((resolve) => setTimeout(resolve, 20));
+          if (grandchild > 0) break;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
         }
+        await new Promise((resolve) => setTimeout(resolve, 20));
       }
       assert.ok(grandchild > 0, "fixture shell must start its grandchild");
       const started = Date.now();
@@ -139,6 +144,8 @@ test("actual Sandcastle library manages execution, failures and worktrees", asyn
       assert.throws(() => process.kill(grandchild, 0), { code: "ESRCH" });
     } finally {
       clearTimeout(watchdog);
+      controller.abort();
+      await pending.catch(() => {});
     }
   } finally {
     process.env.PATH = originalPath;

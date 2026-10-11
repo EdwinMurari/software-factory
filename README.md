@@ -23,6 +23,7 @@ The [editable diagram](docs/factory-loop.excalidraw) shows the build loop the qu
 - Review-repair uses fresh reviews and repairs until zero findings, green checks and verified acceptance.
 - Limits, no progress, cancellation and blockers leave the job incomplete.
 - Missing product requirements are an explicit review limitation, not approval.
+- An integration conflict stops the job incomplete. No automated conflict-repair worker exists. Inspect the retained work, then submit a newly approved request.
 - An interrupted job is incomplete. Inspect its retained work, then submit a newly approved request as the [AFK guide](afk/README.md) describes. There is no resume, adopt, reopen or multi-repo orchestration.
 
 ## Install

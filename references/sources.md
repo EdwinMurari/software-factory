@@ -77,7 +77,7 @@ Treat prompts, skills, files, memory and tools as one context system. Conflicts 
 
 This version runs as a Berry queue job on a registered Git repository. The Berry queue dispatches work and checks in a fixed order; agents still make fallible implementation and review decisions. Project commands and acceptance scenarios remain local. Model choices remain unchanged. Workers run on the host with Sandcastle `noSandbox()`, an explicit deployment choice; this is not a security sandbox. Nothing in a source grants permission to deploy, publish, message others, or widen a task.
 
-A worker adapter separates model access from the loop. A future Berry LLM Gateway adapter must follow the live Gateway contract and identity rules in `berry-llm-gateway`; a model endpoint alone does not provide a coding agent's filesystem and tool execution loop. Future unattended scheduling also needs an explicit execution and spending policy. Neither is silently enabled here.
+A worker adapter separates model access from the loop. A future Berry LLM Gateway adapter must follow the live Gateway contract and identity rules in `berry-llm-gateway`; a model endpoint alone does not provide a coding agent's filesystem and tool execution loop. The queue already runs unattended under the registered repository configuration. The Gateway adapter is a separate point: it is not enabled here.
 
 ## Iterative repair loops
 
@@ -87,4 +87,4 @@ For this factory, the user chose fresh reviewer sessions and repair until no fin
 
 ## Isolated execution
 
-The installed `ask-matt` remains the routing source. The installed `implement-spec` supplied the design reference: ready graph frontiers, one branch/worktree per task, integration before dependencies, conflict repair, and final combined review. The Berry queue applies those mechanics with ready batches and fresh sessions. It retains failed worktrees instead of removing useful failure evidence. Product choices and explicit deferrals remain human decisions. These are local engineering choices, not external standards. Matt’s catalogue is installed separately and is not bundled or automatically synchronized here.
+The installed `ask-matt` remains the routing source. The installed `implement-spec` supplied the design reference: ready graph frontiers, one branch/worktree per task, integration before dependencies, and final combined review. The Berry queue applies those mechanics with ready batches and fresh sessions. An integration conflict stops the job incomplete. No automated conflict-repair worker exists. It retains failed worktrees instead of removing useful failure evidence. Product choices and explicit deferrals remain human decisions. These are local engineering choices, not external standards. Matt’s catalogue is installed separately and is not bundled or automatically synchronized here.

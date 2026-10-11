@@ -30,6 +30,7 @@ For an audit, investigate during intake, before submission. Keep every original 
 - **Review-repair** repeats fresh reviews and repairs until there are zero findings, green checks and verified acceptance.
 - Round limits, timeouts, no progress, cancellation and blockers leave the job incomplete. Do not weaken a gate to pass.
 - Missing product requirements are an explicit review limitation. A review without a spec reports that limit; it approves nothing.
+- An integration conflict stops the job incomplete. No automated conflict-repair worker exists. Inspect the retained work, then submit a newly approved request.
 - An interrupted job is incomplete. Inspect the retained work and evidence, then submit a newly approved request with a new key, as the deployed guide describes. No resume, adopt, reopen or close command exists.
 
 ## Submit

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, writeFile, readFile } from "node:fs/promises";
+import { mkdtemp, writeFile, readFile, chmod } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { executeJob } from "../src/engine.js";
@@ -183,4 +183,55 @@ test("dirty source is preserved and review needs explicit pinned ancestor", asyn
     /must be clean/,
   );
   assert.equal(await readFile(join(root, "local.txt"), "utf8"), "retain");
+});
+
+test("planner branch mutation is rejected before implementation", async () => {
+  const { root, config } = await fixture();
+  await assert.rejects(executeJob("branch", "Spec", "build", config,
+    fake(root, async (req) => {
+      assert.equal(req.role, "planner");
+      assert.equal((await command(req.cwd, "git", ["checkout", "-b", "mutated"])).code, 0);
+      return JSON.stringify({ tickets: [ticket("a")], blockers: [] });
+    }), () => {}), /Planner changed Git state/);
+});
+test("abort during final publication cannot return complete", async () => {
+  const { root, config } = await fixture();
+  const outside = await mkdtemp(join(tmpdir(), "afk-publish-abort-"));
+  const count = join(outside, "count");
+  const marker = join(outside, "publishing");
+  const shim = join(outside, "git");
+  // Delay only the second branch query: the first supplies controller evidence.
+  await writeFile(shim, `#!/bin/sh
+if [ "$1" = branch ] && [ "$2" = --show-current ]; then
+  if [ -f '${count}' ]; then
+    touch '${marker}'
+    sleep 10
+  else
+    touch '${count}'
+  fi
+fi
+exec /usr/bin/git "$@"
+`);
+  await chmod(shim, 0o755);
+  const originalPath = process.env.PATH;
+  process.env.PATH = outside + ":" + originalPath;
+  const controller = new AbortController();
+  let publishing = false;
+  const watch = setInterval(() => {
+    void readFile(marker).then(() => {
+      publishing = true;
+      controller.abort(new Error("timeout during publication"));
+    }, () => {});
+  }, 5);
+  try {
+    const baseline = (await command(root, "git", ["rev-parse", "HEAD"])).output.trim();
+    await assert.rejects(executeJob("publish-abort", "Spec", "review-only", config,
+      fake(root, async () => JSON.stringify({ findings: [], blockers: [],
+        coverage: [{ criterion: "spec", evidence: "inspected", status: "verified" }] })),
+      () => {}, controller.signal, baseline), /timeout during publication/);
+    assert.equal(publishing, true);
+  } finally {
+    clearInterval(watch);
+    process.env.PATH = originalPath;
+  }
 });

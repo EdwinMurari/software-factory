@@ -10,7 +10,7 @@ import {
   type Ticket,
   type Flow,
 } from "./contracts.js";
-import { sourceHash, checkSource, command } from "./source.js";
+import { sourceHash, gitState, checkSource, command } from "./source.js";
 const contract =
   "You are a factory worker. Do only the assigned stage. Never launch a nested factory. Use installed ask-matt to select current-stage guidance only. The service owns ticket persistence and delivery; do not publish tracker tickets or ask humans directly. Follow guidance for the assigned stage; review examines Standards and Spec in read-only mode. Return only JSON. Do not infer product approval. A missing material product choice is blocked. Work only within supplied spec and repository. No push, deploy, credentials output, or main branch modification.";
 export async function plan(
@@ -63,12 +63,13 @@ export async function reviewRepair(
 ) {
   const seen = new Set<string>();
   for (let round = 0; round < config.maxRounds; round++) {
-    const before = await sourceHash(cwd);
+    const before = await sourceHash(cwd, signal);
     if (seen.has(before)) throw new Incomplete("Repeated source state");
     seen.add(before);
     const checks = await checkSource(cwd, config.checks, signal, (checks) =>
       sink("checks", { round, checks }),
     );
+    const reviewerGit = await gitState(cwd, signal);
     // Every execute starts a new agent session. Previous reviews and implementer conversation are excluded.
     const review = parseReview(
       await runtime.execute({
@@ -78,8 +79,11 @@ export async function reviewRepair(
         prompt: `${contract}\nFresh read-only review of the complete change against spec and standards. ${ticket ? "Judge only this assigned ticket: " + JSON.stringify(ticket) + ". The full spec is context. Other tickets are out of scope; do not request their implementation." : "Judge all spec acceptance for the combined result."} ${acceptance ? "Required coverage criteria: " + JSON.stringify(acceptance) : ""} ${ticket ? "Evaluate only assigned ticket product behavior. Defer other spec requirements to the combined review." : "Evaluate requested product behavior against the entire spec, including omissions not caught by the planner."} Current-run workflow and delivery constraints are owned by controller gates, separate from product acceptance. Assess observed state and report current violations; do not add historical absence of external actions as a task criterion or claim it verified. Host noSandbox cannot attest unobserved historical agent actions; an explicit requested attestation remains pending. Controller state evidence: ${JSON.stringify(controllerEvidence ?? {})}. Inspect all current source, untracked files and diff against baseline ${baseline}. Do not modify source. Return {"findings":[{"id":"...","file":"...","description":"...","repair":"..."}],"blockers":[],"coverage":[{"criterion":"...","evidence":"Observed check or source evidence","status":"verified"|"pending"}]}. Enumerate every scoped acceptance criterion; unobserved claims are pending.\nSpec: ${spec}\nStandards: ${config.standards}\nExternal check integrity: contentSha256 is SHA256 of raw file bytes and matches sha256sum. fingerprintSha256 additionally covers decimal lstat.mode and symlink target using the algorithm recorded in externalIntegrity; compare matching fields only. Original registration pins are before values; current measurements are after values. Current source hash: ${before}\nChecks: ${JSON.stringify(checks)}`,
       }),
     );
-    if ((await sourceHash(cwd)) !== before)
+    if ((await sourceHash(cwd, signal)) !== before)
       throw new Incomplete("Reviewer changed source");
+    if ((await gitState(cwd, signal)) !== reviewerGit)
+      throw new Incomplete("Reviewer changed Git state");
+    signal?.throwIfAborted();
     sink("review", { round, sourceHash: before, review });
     if (
       acceptance &&
@@ -117,7 +121,7 @@ export async function reviewRepair(
     );
     sink("repair", { round, outcome });
     if (outcome.status === "blocked") throw new Blocked(outcome.summary);
-    if ((await sourceHash(cwd)) === before)
+    if ((await sourceHash(cwd, signal)) === before)
       throw new Incomplete("Repair made no source progress");
   }
   throw new Incomplete("Review round budget exhausted");
@@ -187,11 +191,16 @@ export async function integrate(
   const head = await command(ticketRoot, "git", ["rev-parse", "HEAD"], signal);
   return { status: "done", summary: head.output.trim() };
 }
-export async function publish(cwd: string) {
-  const branch = await command(cwd, "git", ["branch", "--show-current"]);
+export async function publish(cwd: string, signal?: AbortSignal) {
+  const branch = await command(
+    cwd, "git", ["branch", "--show-current"], signal,
+  );
+  if (branch.code) throw new Incomplete("Cannot read publication branch");
+  const currentSource = await sourceHash(cwd, signal);
+  signal?.throwIfAborted();
   return {
     worktree: cwd,
     branch: branch.output.trim(),
-    sourceHash: await sourceHash(cwd),
+    sourceHash: currentSource,
   };
 }

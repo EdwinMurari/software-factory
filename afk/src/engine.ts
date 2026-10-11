@@ -6,7 +6,7 @@ import type {
 } from "./contracts.js";
 import { Incomplete, Blocked } from "./contracts.js";
 import { plan, implement, reviewRepair, integrate, publish } from "./steps.js";
-import { command, sourceHash } from "./source.js";
+import { command, sourceHash, gitState } from "./source.js";
 export async function executeJob(
   id: string,
   spec: string,
@@ -27,7 +27,8 @@ export async function executeJob(
     throw new Incomplete(
       "Registered repository must be clean; preserve and commit current work before submission",
     );
-  const initial = await sourceHash(config.root);
+  const initial = await sourceHash(config.root, signal);
+  const registeredGit = await gitState(config.root, signal);
   const head = await command(config.root, "git", ["rev-parse", "HEAD"], signal);
   if (head.code) throw new Incomplete("No git baseline");
   const baseline = comparisonBase ?? head.output.trim();
@@ -51,15 +52,19 @@ export async function executeJob(
   sink("worktree", { path: target });
   let acceptance: string[] | undefined;
   if (flow === "build") {
-    const plannerHash = await sourceHash(target);
+    const plannerGit = await gitState(target, signal);
+    const plannerHash = await sourceHash(target, signal);
     const planned = await plan(
       runtime,
       spec,
       { ...config, root: target },
       signal,
     );
-    if ((await sourceHash(target)) !== plannerHash)
+    if ((await sourceHash(target, signal)) !== plannerHash)
       throw new Incomplete("Planner changed source");
+    if ((await gitState(target, signal)) !== plannerGit)
+      throw new Incomplete("Planner changed Git state");
+    signal?.throwIfAborted();
     sink("plan", planned);
     acceptance = planned.tickets.flatMap((t) => t.acceptance);
     if (
@@ -131,9 +136,11 @@ export async function executeJob(
   const observedHead = (
     await command(config.root, "git", ["rev-parse", "HEAD"], signal)
   ).output.trim();
-  const observedSource = await sourceHash(config.root);
+  const observedSource = await sourceHash(config.root, signal);
   if (observedHead !== head.output.trim() || observedSource !== initial)
     throw new Incomplete("Registered source changed before final review");
+  if ((await gitState(config.root, signal)) !== registeredGit)
+    throw new Incomplete("Registered Git state changed before final review");
   const controllerEvidence = {
     stage: "combined",
     registeredHead: { baseline: head.output.trim(), current: observedHead },
@@ -164,7 +171,11 @@ export async function executeJob(
     ).output.trim() !== head.output.trim()
   )
     throw new Incomplete("Registered source HEAD changed during job");
-  if ((await sourceHash(config.root)) !== initial)
+  if ((await sourceHash(config.root, signal)) !== initial)
     throw new Incomplete("Registered source changed during job");
-  return { ...result, ...(await publish(target)) };
+  if ((await gitState(config.root, signal)) !== registeredGit)
+    throw new Incomplete("Registered Git state changed during job");
+  const published = await publish(target, signal);
+  signal?.throwIfAborted();
+  return { ...result, ...published };
 }

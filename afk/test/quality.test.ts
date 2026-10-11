@@ -362,6 +362,10 @@ test("large Git inventories fingerprint early files and reject their mutation", 
     ]),
     /changed source/,
   );
+  // app.txt sorts before the large index tail. A bounded Git log would miss it.
+  await assert.rejects(checkSource(root, [{
+    id: "stage-early", command: "/usr/bin/git", args: ["add", "app.txt"],
+  }]), /Checks changed Git state/);
 });
 test("external integrity evidence distinguishes raw content SHA from reproducible metadata fingerprint", async () => {
   const { pinCheck, hash } = await import("../src/source.js");
@@ -397,4 +401,37 @@ test("external integrity evidence distinguishes raw content SHA from reproducibl
   );
   assert.equal(receipt.unchanged, true);
   assert.match(receipt.algorithm, /lstat.mode in decimal/);
+});
+
+const emptyCommit = ["-c", "user.name=Test", "-c", "user.email=test@test",
+  "commit", "--allow-empty", "-m", "retained mutation"];
+test("review-only rejects an empty reviewer commit with unchanged source", async () => {
+  const root = await repo();
+  await writeFile(join(root, "app.txt"), "good");
+  const before = await sourceHash(root);
+  await assert.rejects(reviewRepair(runtime(async () => {
+    assert.equal((await command(root, "git", emptyCommit)).code, 0);
+    return review();
+  }), "Spec", root, "HEAD", config(root), "review-only", () => {}), /Reviewer changed Git state/);
+  assert.equal(await sourceHash(root), before);
+});
+test("read-only checks reject staging that leaves source bytes unchanged", async () => {
+  const root = await repo();
+  await writeFile(join(root, "app.txt"), "good");
+  const before = await sourceHash(root);
+  await assert.rejects(checkSource(root, [{
+    id: "stager", command: "/usr/bin/git", args: ["add", "app.txt"],
+  }]), /Checks changed Git state/);
+  assert.equal(await sourceHash(root), before);
+  assert.match((await command(root, "git", ["diff", "--cached"])).output, /good/);
+});
+test("an empty repair commit cannot create source progress", async () => {
+  const root = await repo();
+  let reviews = 0;
+  await assert.rejects(reviewRepair(runtime(async (req) => {
+    if (req.role === "reviewer") { reviews++; return review([finding]); }
+    assert.equal((await command(root, "git", emptyCommit)).code, 0);
+    return '{"status":"done","summary":"empty commit"}';
+  }), "Spec", root, "HEAD", config(root), "build", () => {}), /no source progress/);
+  assert.equal(reviews, 1);
 });

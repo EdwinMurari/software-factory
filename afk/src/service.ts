@@ -4,6 +4,7 @@ import { setTimeout } from "node:timers/promises";
 import { Queue } from "./queue.js";
 import { startApi } from "./api.js";
 import { createRuntime } from "./runtime.js";
+import { recordCompletion } from "./service-completion.js";
 import { executeJob } from "./engine.js";
 import { validateConfig } from "./config.js";
 import { Blocked } from "./contracts.js";
@@ -55,17 +56,7 @@ try {
         active.signal,
         job.input.baseline,
       );
-      queue.finishAttempt(
-        job.id,
-        attempt.id,
-        result.status === "complete" ? "complete" : "incomplete",
-        result,
-      );
-      queue.finish(
-        job.id,
-        result.status === "complete" ? "complete" : "incomplete",
-        result,
-      );
+      recordCompletion(queue, job.id, attempt.id, result, active.signal);
     } catch (error) {
       const reason =
         error instanceof Error ? error.message : "Execution failed";

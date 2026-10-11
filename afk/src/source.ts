@@ -61,18 +61,22 @@ export async function command(
     if (signal?.aborted) abort();
   });
 }
-export async function sourceHash(root: string): Promise<string> {
+export async function sourceHash(
+  root: string,
+  signal?: AbortSignal,
+): Promise<string> {
   const listed = await command(
     root,
     "git",
     ["ls-files", "-z", "--cached", "--others", "--exclude-standard"],
-    undefined,
+    signal,
     "machine",
   );
   if (listed.code) throw new Incomplete("Cannot fingerprint source");
   const paths = [...new Set(listed.output.split("\0").filter(Boolean))].sort();
   const pieces: string[] = [];
   for (const path of paths) {
+    signal?.throwIfAborted();
     const full = resolve(root, path),
       rel = relative(root, full);
     if (isAbsolute(rel) || rel.startsWith(".."))
@@ -86,7 +90,7 @@ export async function sourceHash(root: string): Promise<string> {
           "\0" +
           (stat.isSymbolicLink()
             ? "link:" + (await readlink(full))
-            : "file:" + hash(await readFile(full))),
+            : "file:" + hash(await readFile(full, { signal }))),
       );
     } catch (e) {
       if ((e as NodeJS.ErrnoException).code === "ENOENT")
@@ -94,6 +98,27 @@ export async function sourceHash(root: string): Promise<string> {
       else throw e;
     }
   }
+  signal?.throwIfAborted();
+  return hash(pieces.join("\0"));
+}
+// Retained observable state only. Worktree-local HEAD, branch and index entries
+// exclude Git timestamps and refs owned by concurrent worktrees.
+export async function gitState(
+  root: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  const pieces: string[] = [];
+  for (const args of [
+    ["rev-parse", "HEAD"],
+    ["symbolic-ref", "-q", "HEAD"],
+    ["ls-files", "--stage", "-z"],
+  ]) {
+    const result = await command(root, "git", args, signal, "machine");
+    if (result.code && !(args[0] === "symbolic-ref" && result.code === 1))
+      throw new Incomplete("Cannot fingerprint Git state");
+    pieces.push(result.output);
+  }
+  signal?.throwIfAborted();
   return hash(pieces.join("\0"));
 }
 export const integrityAlgorithm =
@@ -156,8 +181,9 @@ export async function checkSource(
   record?: (evidence: CheckEvidence[]) => void,
 ): Promise<CheckEvidence[]> {
   if (!checks.length) throw new Incomplete("No registered checks");
-  const before = await sourceHash(root),
+  const before = await sourceHash(root, signal),
     results: CheckEvidence[] = [];
+  const beforeGit = await gitState(root, signal);
   let integrityChanged = false;
   for (const check of checks) {
     for (const pin of check.integrity ?? [])
@@ -195,7 +221,10 @@ export async function checkSource(
   record?.(results);
   if (integrityChanged)
     throw new Incomplete("Registered check integrity changed during execution");
-  if ((await sourceHash(root)) !== before)
+  if ((await sourceHash(root, signal)) !== before)
     throw new Incomplete("Checks changed source");
+  if ((await gitState(root, signal)) !== beforeGit)
+    throw new Incomplete("Checks changed Git state");
+  signal?.throwIfAborted();
   return results;
 }

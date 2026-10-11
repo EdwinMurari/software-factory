@@ -10,6 +10,7 @@ import {
   validateInput,
   type JobInput,
 } from "../src/queue.js";
+import { recordCompletion } from "../src/service-completion.js";
 const input = (key = "one"): JobInput => ({
   spec: "Make one documented change",
   repository: "fixture",
@@ -167,5 +168,28 @@ test("flow arrays cannot bypass the review-only mode guard", () => {
     assert.equal(queue.list().length, 0);
   } finally {
     queue.close();
+  }
+});
+
+test("service abort after worker result cannot record completion", () => {
+  for (const reason of ["timeout", "shutdown"]) {
+    const queue = new Queue(":memory:");
+    try {
+      const job = queue.submit(input(), {});
+      queue.claim();
+      const attempt = queue.beginAttempt(job.id, "execute");
+      const controller = new AbortController();
+      const result = { status: "complete", branch: "verified" };
+      controller.abort(new Error(reason));
+      assert.throws(() => recordCompletion(queue, job.id, attempt.id, result, controller.signal),
+        new RegExp(reason));
+      // The service's error path retains the interruption as incomplete.
+      queue.finishAttempt(job.id, attempt.id, "incomplete", { reason });
+      queue.finish(job.id, "incomplete", { reason });
+      const detail = queue.getDetail(job.id);
+      assert.equal(detail.status, "incomplete");
+      assert.equal(detail.attempts[0]?.status, "incomplete");
+      assert.equal(detail.events.some(event => event.type === "complete"), false);
+    } finally { queue.close(); }
   }
 });

@@ -806,6 +806,15 @@ class Controller:
                     and not (pending and pending["label"] == "integration_repair")):
                 entry = resume_initial_review
                 checks = entry["checks"]
+                if review_only and all(c["status"] in ("passed", "failed") for c in checks):
+                    completed = {c["check_id"] for c in checks}
+                    missing = [cid for cid in dict.fromkeys(required + self.plan["integration_checks"])
+                               if cid not in completed]
+                    if missing:
+                        # Retain failed evidence. An interrupted report-only
+                        # check batch still owes its remaining checks and review.
+                        entry["review"] = None
+                        checks = checks + self.run_checks(missing)
             else:
                 progress = self.progress()
                 entry = {"number": len(self.report["integration_attempts"]) + 1, "checks": [], "review": None,

@@ -278,13 +278,23 @@ class ReviewTests(unittest.TestCase):
         self.assertFalse((self.f.repo / 'fix.txt').exists())
         self.assertEqual(self.cli('complete', self.report)[0], 0)
 
-    def assert_failed_check_interruption_retained(self, boundary, only=False):
+    def assert_failed_check_interruption_retained(self, boundary, only=False, remaining_status='passed'):
         marker = self.f.base / 'check-count'
         self.f.plan['checks'][0]['argv'][-1] = (
             "from pathlib import Path; "
             f"p=Path({str(marker)!r}); ran=p.exists(); p.write_text('ran'); "
             "raise SystemExit(0 if ran else 1)")
         self.f.plan['input']['review_only'] = only
+        if only:
+            second_marker = self.f.base / 'second-check-count'
+            self.f.plan['checks'].append({'id': 'second', 'repo': 'app', 'argv':
+                [sys.executable, '-c', "from pathlib import Path; "
+                 f"p=Path({str(second_marker)!r}); p.write_text(p.read_text() + 'x' if p.exists() else 'x')"]})
+            self.f.plan['integration_checks'].append('second')
+            if remaining_status == 'source_changed':
+                self.f.plan['checks'][-1]['argv'][-1] += "; Path('existing.txt').write_text('bad')"
+            elif remaining_status == 'cancelled':
+                self.f.plan['checks'][-1]['argv'][-1] += "; import time; time.sleep(10)"
         self.f.plan_path.write_text(json.dumps(self.f.plan))
         self.register()
         wrapper = self.f.base / 'interrupt-cli.py'
@@ -313,7 +323,37 @@ class ReviewTests(unittest.TestCase):
         self.assertTrue(any(p['phase'].startswith('check-') and p['status']=='failed'
                             for p in retained['processes']))
         before = factory.snapshot(self.f.repo)
-        code, value = self.cli('continue', self.report)
+        if remaining_status == 'cancelled':
+            wrapper.write_text(f"import sys; sys.path.insert(0, {str(Path(factory.__file__).parent)!r})\n" +
+                "import factory, factory_v2, threading\nfrom unittest.mock import patch\n" +
+                "original=factory_v2.Session.execute\n" +
+                "def cancel(session, *args, **kwargs):\n" +
+                "    if args[1]!='check-second': return original(session, *args, **kwargs)\n" +
+                "    timer=threading.Timer(0.2, session.runtime.stop)\n" +
+                "    timer.start()\n" +
+                "    try: return original(session, *args, **kwargs)\n" +
+                "    finally: timer.cancel(); timer.join()\n" +
+                "with patch.object(factory_v2.Session, 'execute', new=cancel):\n" +
+                "    raise SystemExit(factory.main(sys.argv[1:]))\n")
+            resumed = subprocess.run([sys.executable, str(wrapper), 'continue', str(self.report)],
+                                     capture_output=True, text=True, timeout=90)
+            code, value = resumed.returncode, json.loads(resumed.stdout)
+        else:
+            code, value = self.cli('continue', self.report)
+        if remaining_status != 'passed':
+            self.assertNotEqual(code, 0, value)
+            self.assertIn('Final check interrupted, unavailable or changed source', value['reason'])
+            report = json.loads(self.report.read_text())
+            self.assertEqual([(c['check_id'], c['status']) for c in report['final_checks']],
+                             [('contents', 'failed'), ('second', remaining_status)])
+            self.assertEqual(self.f.calls(), [])
+            self.assertEqual(factory.snapshot(self.f.repo), before)
+            self.assertEqual(second_marker.read_text(), 'x')
+            self.assertNotEqual(self.cli('continue', self.report)[0], 0)
+            self.assertNotEqual(self.cli('complete', self.report)[0], 0)
+            self.assertEqual(self.f.calls(), [])
+            self.assertEqual(second_marker.read_text(), 'x')
+            return
         self.assertEqual(code, 0, value)
         report = json.loads(self.report.read_text())
         calls = self.f.calls()
@@ -324,6 +364,13 @@ class ReviewTests(unittest.TestCase):
         if only:
             self.assertEqual(report['status'], 'reviewed')
             self.assertEqual(report['final_checks'][0]['status'], 'failed')
+            self.assertEqual([(c['check_id'], c['status']) for c in report['final_checks']],
+                             [('contents', 'failed'), ('second', 'passed')])
+            self.assertEqual(second_marker.read_text(), 'x')
+            self.assertEqual(marker.read_text(), 'ran')
+            final = json.loads((self.output / 'final/report.json').read_text())
+            self.assertEqual(len([p for p in final['processes'] if p['phase'] == 'check-contents']), 1)
+            self.assertEqual([c['check_id'] for c in calls[0]['request']['evidence']], ['contents', 'second'])
             self.assertFalse((Path(report['repositories']['app']['worktree']) / 'fix.txt').exists())
         else:
             self.assertIn('failed', json.dumps(calls[1]['request']['evidence']))
@@ -344,6 +391,15 @@ class ReviewTests(unittest.TestCase):
 
     def test_report_only_retains_failed_check_after_review_interruption(self):
         self.assert_failed_check_interruption_retained('review-dispatch', only=True)
+
+    def test_report_only_runs_missing_checks_after_failed_check_handoff(self):
+        self.assert_failed_check_interruption_retained('check-result', only=True)
+
+    def test_report_only_recovered_missing_check_mutation_stops_before_review(self):
+        self.assert_failed_check_interruption_retained('check-result', only=True, remaining_status='source_changed')
+
+    def test_report_only_recovered_missing_check_cancellation_stops_before_review(self):
+        self.assert_failed_check_interruption_retained('check-result', only=True, remaining_status='cancelled')
 
     def test_report_only_retains_failed_check_after_review_result_handoff(self):
         self.assert_failed_check_interruption_retained('review-result', only=True)
@@ -447,6 +503,9 @@ class ReviewTests(unittest.TestCase):
 
     def test_report_only_failed_checks_are_reported_and_never_repaired(self):
         self.f.plan['checks'][0]['argv'][-1] = "raise SystemExit(7)"
+        self.f.plan['checks'].append({'id': 'second', 'repo': 'app',
+                                     'argv': [sys.executable, '-c', 'print("second check")']})
+        self.f.plan['integration_checks'].append('second')
         self.f.plan_path.write_text(json.dumps(self.f.plan))
         code, value, report = self.review(only=True)
         self.assertEqual(code, 0, value)
@@ -454,6 +513,10 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(completion['status'], 'reviewed')
         self.assertFalse(completion['verified'])
         self.assertEqual(completion['check_failures'], ['contents'])
+        self.assertEqual([(c['check_id'], c['status']) for c in report['final_checks']],
+                         [('contents', 'failed'), ('second', 'passed')])
+        self.assertEqual([c['check_id'] for c in self.f.calls()[0]['request']['evidence']],
+                         ['contents', 'second'])
         self.assertEqual([c['phase'] for c in self.f.calls()], ['final_review'])
 
     def test_report_only_reviewer_mutation_is_durably_incomplete(self):

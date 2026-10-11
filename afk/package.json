@@ -1,0 +1,20 @@
+{
+  "name": "berry-afk",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "tsx --test test/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "start": "tsx src/service.ts",
+    "cli": "tsx src/cli.ts"
+  },
+  "dependencies": {
+    "@ai-hero/sandcastle": "0.12.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.0.0",
+    "tsx": "4.20.6",
+    "typescript": "5.9.3"
+  }
+}

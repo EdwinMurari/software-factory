@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+export PATH="/home/berry/.nvm/versions/node/v26.5.0/bin:/home/berry/.local/bin:/usr/local/bin:/usr/bin:/bin"
+exec /home/berry/.nvm/versions/node/v26.5.0/bin/node \
+  --import /srv/appdata/berry/state/services/software-factory/runtime/node_modules/tsx/dist/loader.mjs \
+  /srv/appdata/berry/projects/services/software-factory/afk/src/cli.ts "$@"

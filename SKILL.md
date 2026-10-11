@@ -48,3 +48,7 @@ Stop when the acceptance evidence, relevant checks, and review support the resul
 Report the product outcome, essential evidence, remaining gaps, and delivery state. Commit substantial changes as the project requires. Deployment, publishing, and external actions follow the user's actual authorization. Local verification is not field verification, and green checks do not establish bug freedom.
 
 Keep future workflow improvements separate from the current feature. Use a selected retrospective after demonstrated friction; propose policy changes rather than starting an endless self-improvement loop. [sources.md](references/sources.md) records the source lessons, limits, and deliberate adaptations.
+
+## Explicit AFK Berry requests
+
+For an explicit AFK request, read the deployed guide with `ssh gl502 'cat /srv/appdata/berry/projects/services/software-factory/afk/README.md'`. Use the installed `/home/berry/.local/bin/berry-afk` command over SSH to submit the approved immutable spec. Select a registered repository ID and a stable idempotency key. The service owns planning, worktrees, checks, fresh reviews, repair and integration. Report the job ID and query its durable status. Completion requires a complete job and observed acceptance evidence. Report blocked, cancelled or interrupted work as incomplete. Existing on-demand Python factory interfaces remain available.

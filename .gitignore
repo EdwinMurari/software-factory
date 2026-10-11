@@ -3,3 +3,6 @@ __pycache__/
 .DS_Store
 .env
 .env.*
+node_modules/
+afk/*.sqlite*
+afk/node_modules

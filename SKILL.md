@@ -49,7 +49,7 @@ ssh gl502 '/home/berry/.local/bin/berry-afk submit --repository REGISTERED_ID --
 ssh gl502 '/home/berry/.local/bin/berry-afk status JOB_ID'
 ```
 
-Flows are `build`, `review-repair` and `review-only`. The two review flows need `--baseline FULL_40_CHARACTER_COMMIT_SHA`. For an unregistered project, an operator registers its repository root and trusted checks as the guide describes. Report blocked if operator access is missing. Do not auto-enable arbitrary repositories.
+Flows are `build`, `review-repair` and `review-only`. The two review flows need `--baseline FULL_40_CHARACTER_COMMIT_SHA`. For an unregistered project, register its repository root and trusted checks through authorized operator access as the guide describes. A coding agent with that access can do this. Report blocked if access or project authorization is missing. Do not auto-enable arbitrary repositories.
 
 Report the job ID and the durable status. Completion needs a complete job and observed acceptance evidence. Report blocked, cancelled or interrupted work as incomplete. The queue does not push or deploy; the retained branch and worktree are the output.
 

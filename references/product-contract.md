@@ -47,6 +47,6 @@ The submitted spec is an execution input, not proof that a human approved a prod
 
 Keep every supplied point with its source references. Group only with an explicit reason, then investigate each point or group in a fresh read-only worker. Record evidence and a confirmed, disproved or blocked disposition. Working changes are part of investigation freshness.
 
-Use the installed `ask-matt` router for the next workflow; read the selected skill. Ask about each material product question separately. Preserve the actual user response in a referenced file, with a content hash. A resolved flag or investigation recommendation without that record cannot open the build gate. Records are traceable evidence, not identity authentication.
+Use the installed `ask-matt` router for the next workflow; read the selected skill. Ask about each material product question separately. Preserve the actual user decision in the approved spec or its existing source record. Resolve material choices before submission. These are intake responsibilities; the queue does not validate decision IDs or response-file hashes.
 
-Map each point to approved tasks, a disproved finding, a blocker, or a user-approved deferral. Attach required decision IDs to the dependent tasks. Keep deferrals distinct from implemented work. If sources, points, evidence or decision records change, investigate or agree again where needed before building.
+Map each point to approved tasks, a disproved finding, a blocker, or a user-approved deferral. Include relevant approved decisions in the spec so fresh workers receive them. Keep deferrals distinct from implemented work. If sources, points, evidence or decision records change, investigate or agree again where needed before building.

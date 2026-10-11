@@ -209,6 +209,66 @@ class ReviewTests(unittest.TestCase):
         self.assertNotEqual(self.cli('continue', self.report)[0], 0)
         self.assertEqual(len(self.f.calls()), calls)
 
+    def assert_deleted_input_noop_is_durably_incomplete(self):
+        # A second review would report clean even though the repair made no edit.
+        self.f.fake.write_text(self.f.fake.read_text().replace(
+            "if control.get('findings') and 'review' in phase and not all((p/'fix.txt').exists() for p in paths.values()):",
+            "if control.get('findings') and 'review' in phase and "
+            "sum('review' in json.loads(line)['phase'] for line in (root / 'calls.jsonl').read_text().splitlines()) == 1:"))
+        self.configure(findings=True, no_progress=True)
+        before = factory.snapshot(self.f.repo)
+        code, value, report = self.review()
+        self.assertNotEqual(code, 0, value)
+        self.assertEqual(value['status'], 'incomplete')
+        self.assertIn('no source progress', value['reason'])
+        self.assertEqual(factory.snapshot(self.f.repo), before)
+        self.assertEqual([c['phase'] for c in self.f.calls()],
+                         ['final_review', 'integration_repair'])
+        saved = json.loads((self.output / 'final' / 'report.json').read_text())
+        self.assertTrue(saved['integration_no_progress_stop'])
+        for _ in range(2):
+            code, value = self.cli('continue', self.report)
+            self.assertNotEqual(code, 0, value)
+            self.assertEqual(value['status'], 'incomplete')
+            self.assertIn('no source progress', value['reason'])
+        self.assertEqual(len(self.f.calls()), 2)
+        self.assertNotEqual(self.cli('complete', self.report)[0], 0)
+        self.assertEqual(self.cli('status', self.report)[1]['status'], 'incomplete')
+
+    def test_unstaged_tracked_deletion_noop_cannot_reach_lucky_clean_review(self):
+        doomed = self.f.repo / 'doomed.txt'
+        doomed.write_text('tracked content')
+        self.f.git(self.f.repo, 'add', '.')
+        self.f.git(self.f.repo, 'commit', '-qm', 'existing tracked work')
+        doomed.unlink()
+        self.assert_deleted_input_noop_is_durably_incomplete()
+
+    def test_deleted_intent_to_add_noop_cannot_reach_lucky_clean_review(self):
+        doomed = self.f.repo / 'doomed.txt'
+        doomed.write_text('pending content')
+        self.f.git(self.f.repo, 'add', '-N', '.')
+        doomed.unlink()
+        (self.f.repo / 'dirty.txt').write_text('existing dirt to commit')
+        self.assert_deleted_input_noop_is_durably_incomplete()
+
+    def test_unstaged_deletion_with_actual_repair_reaches_fresh_review(self):
+        doomed = self.f.repo / 'doomed.txt'
+        doomed.write_text('tracked content')
+        self.f.git(self.f.repo, 'add', '.')
+        self.f.git(self.f.repo, 'commit', '-qm', 'existing tracked work')
+        doomed.unlink()
+        self.configure(findings=True)
+        before = factory.snapshot(self.f.repo)
+        code, value, report = self.review()
+        self.assertEqual(code, 0, value)
+        self.assertEqual([c['phase'] for c in self.f.calls()],
+                         ['final_review', 'integration_repair', 'final_review'])
+        copy = Path(report['repositories']['app']['worktree'])
+        self.assertFalse((copy / 'doomed.txt').exists())
+        self.assertEqual((copy / 'fix.txt').read_text(), 'x')
+        self.assertEqual(factory.snapshot(self.f.repo), before)
+        self.assertEqual(self.cli('complete', self.report)[0], 0)
+
     def test_report_only_failed_checks_are_reported_and_never_repaired(self):
         self.f.plan['checks'][0]['argv'][-1] = "raise SystemExit(7)"
         self.f.plan_path.write_text(json.dumps(self.f.plan))

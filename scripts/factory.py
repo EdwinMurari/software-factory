@@ -158,7 +158,10 @@ def snapshot(project, content_only=False):
                 raise FactoryError(f"Unsupported source input: {path}")
             records.append([os.fsdecode(raw), stat.S_IMODE(info.st_mode), digest(content)])
         except FileNotFoundError:
-            records.append([os.fsdecode(raw), "deleted"])
+            # Missing index paths disappear when the controller commits existing
+            # dirt. That changes input evidence, but is not a source edit.
+            if not content_only:
+                records.append([os.fsdecode(raw), "deleted"])
         except OSError as exc:
             raise FactoryError(f"Cannot fingerprint {path}: {exc}") from exc
     return digest(encoded(records if content_only else {"head": head.decode().strip(), "index": digest(index),

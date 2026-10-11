@@ -26,6 +26,22 @@ def repository_inputs(repositories):
     return {name: snapshot(path) for name, path in sorted(repositories.items())}
 
 
+def clean_creation_inputs(source, base):
+    """Pin the checkout Git will create, without touching the source index/files."""
+    if os.fsdecode(git(source, "rev-parse", "HEAD")).strip() != base:
+        raise FactoryError("Review creation base no longer matches the pinned source HEAD")
+    with tempfile.TemporaryDirectory(prefix="factory-clean-base-") as temporary:
+        root = Path(temporary)
+        worktree = root / "worktree"
+        worktree.mkdir()
+        environment = {**os.environ,
+                       "GIT_DIR": str((source / os.fsdecode(git(source, "rev-parse", "--git-dir")).strip()).resolve()),
+                       "GIT_INDEX_FILE": str(root / "index"), "GIT_WORK_TREE": str(worktree)}
+        git(source, "read-tree", base, env=environment)
+        git(source, "checkout-index", "--all", "--force", env=environment)
+        return snapshot(worktree, git_env=environment)
+
+
 def controller_hash():
     return digest(encoded({name: digest(Path(__file__).with_name(name).read_bytes())
                            for name in ("factory.py", "factory_v2.py", "factory_audit.py", "factory_lifecycle.py")}))
@@ -461,14 +477,13 @@ class ControllerV2:
         helper = Session(self, {name: source}, self.output / "setup" / role / name, [], {})
         record = {"branch": branch, "worktree": str(path), "base_sha": base}
         setup = {"repo": name, "role": role, **record, "status": "pending", "report": str(helper.output / "report.json"),
-                 "base_inputs": snapshot(self.integration[name] if role.startswith("task-") else source)}
+                 "base_inputs": (clean_creation_inputs(source, base) if self.reviewing and role == "integration"
+                                 else snapshot(self.integration[name] if role.startswith("task-") else source))}
         self.report.setdefault("worktree_setups", []).append(setup)
         self.save()
         try:
             helper.git_operation(source, "worktree", "add", "-b", branch, str(path), base)
             setup["status"] = "created"
-            if self.reviewing and role == "integration":
-                setup["base_inputs"] = snapshot(path)
         except (FactoryError, OSError):
             setup["status"] = "incomplete"
             raise

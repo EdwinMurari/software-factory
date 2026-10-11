@@ -103,9 +103,9 @@ def positive(value, name, maximum=86400):
         raise FactoryError(f"{name} must be positive and at most {maximum}")
 
 
-def git(project, *args):
+def git(project, *args, env=None):
     try:
-        result = subprocess.run(["git", "-C", str(project), *args], capture_output=True, timeout=30)
+        result = subprocess.run(["git", "-C", str(project), *args], capture_output=True, timeout=30, env=env)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise FactoryError(f"Git unavailable: {exc}") from exc
     if result.returncode:
@@ -119,9 +119,9 @@ def repository_lock_path(project):
     return Path(tempfile.gettempdir()) / f"software-factory-{os.getuid()}-{digest(os.fsencode(directory))[:24]}.lock"
 
 
-def index_flags(project):
+def index_flags(project, *, git_env=None):
     """Read semantic index flags without hashing volatile stat-cache data."""
-    remaining = git(project, "ls-files", "--debug", "-z")
+    remaining = git(project, "ls-files", "--debug", "-z", env=git_env)
     flags = []
     while remaining:
         path, remaining = remaining.split(b"\0", 1)
@@ -134,17 +134,17 @@ def index_flags(project):
     return flags
 
 
-def snapshot(project, content_only=False):
+def snapshot(project, content_only=False, *, git_env=None):
     """Hash index entries, HEAD and all tracked/nonignored worktree inputs.
 
     Ignored and external inputs are deliberately outside this contract. Symlink
     text is hashed, not its external target. Submodules are unsupported.
     """
-    index = git(project, "ls-files", "--stage", "-z")
+    index = git(project, "ls-files", "--stage", "-z", env=git_env)
     if any(entry.startswith(b"160000 ") for entry in index.split(b"\0")):
         raise FactoryError("Git submodules are unsupported")
-    head = git(project, "rev-parse", "--verify", "HEAD")
-    paths = set(git(project, "ls-files", "--cached", "--others", "--exclude-standard", "-z").split(b"\0"))
+    head = git(project, "rev-parse", "--verify", "HEAD", env=git_env)
+    paths = set(git(project, "ls-files", "--cached", "--others", "--exclude-standard", "-z", env=git_env).split(b"\0"))
     records = []
     for raw in sorted(paths - {b""}):
         path = Path(project) / os.fsdecode(raw)
@@ -173,7 +173,7 @@ def snapshot(project, content_only=False):
         except OSError as exc:
             raise FactoryError(f"Cannot fingerprint {path}: {exc}") from exc
     return digest(encoded(records if content_only else {"head": head.decode().strip(), "index": digest(index),
-                                                       "index_flags": index_flags(project), "files": records}))
+                                                       "index_flags": index_flags(project, git_env=git_env), "files": records}))
 
 
 def load_plan(path):

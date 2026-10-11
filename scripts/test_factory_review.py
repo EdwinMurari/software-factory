@@ -426,6 +426,85 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(json.loads(self.report.read_text())['run_id'], owner.run_id)
         self.assertEqual(self.cli('complete', self.report)[0], 0)
 
+    def interrupted_creation(self, only=False):
+        (self.f.repo / 'existing.txt').write_text('staged\n')
+        self.f.git(self.f.repo, 'add', 'existing.txt')
+        (self.f.repo / 'existing.txt').write_text('unstaged\n')
+        (self.f.repo / 'dirty.txt').write_text('retain dirt')
+        if only:
+            self.f.plan['input']['review_only'] = True
+            self.f.plan_path.write_text(json.dumps(self.f.plan))
+        before = factory.snapshot(self.f.repo)
+        self.register()
+        owner = factory_v2.ControllerV2(self.f.plan_path, self.output, resume=True)
+        execute = factory_v2.Session.execute
+
+        def interrupt_after_add(session, argv, label, *args, **kwargs):
+            result = execute(session, argv, label, *args, **kwargs)
+            if label == 'git-worktree':
+                raise OSError('worktree add succeeded; creation checkpoint interrupted')
+            return result
+
+        with patch.object(factory_v2.Session, 'execute', new=interrupt_after_add):
+            result = owner.run()
+        self.assertEqual(result['status'], 'incomplete')
+        self.assertEqual(self.f.calls(), [])
+        setup = result['worktree_setups'][0]
+        self.assertEqual(setup['status'], 'incomplete')
+        root = Path(setup['worktree'])
+        self.assertTrue(root.exists())
+        self.assertEqual(self.f.git(root, 'status', '--porcelain'), b'')
+        self.assertEqual(self.f.git(root, 'rev-parse', 'HEAD').decode().strip(), setup['base_sha'])
+        process = json.loads(Path(setup['report']).read_text())['processes'][-1]
+        self.assertEqual(process['argv'][-6:], ['worktree', 'add', '-b', setup['branch'], str(root), setup['base_sha']])
+        self.assertEqual((process['status'], process['exit_code']), ('passed', 0))
+        self.assertEqual(factory.snapshot(self.f.repo), before)
+        return owner.run_id, root, before
+
+    def assert_creation_recovers(self, only):
+        run_id, root, before = self.interrupted_creation(only)
+        code, value = self.cli('continue', self.report)
+        self.assertEqual(code, 0, value)
+        result = json.loads(self.report.read_text())
+        self.assertEqual(result['run_id'], run_id)
+        self.assertEqual(Path(result['repositories']['app']['worktree']), root)
+        self.assertFalse(result.get('adoptions'))
+        self.assertEqual((root / 'existing.txt').read_text(), 'unstaged\n')
+        self.assertEqual(self.f.git(root, 'show', ':existing.txt'), b'staged\n')
+        self.assertEqual((root / 'dirty.txt').read_text(), 'retain dirt')
+        self.assertEqual(factory.snapshot(self.f.repo), before)
+        self.assertEqual([c['phase'] for c in self.f.calls()], ['final_review'])
+        self.assertEqual(self.cli('complete', self.report)[0], 0)
+
+    def test_successful_worktree_add_interruption_recovers_dirty_review(self):
+        self.assert_creation_recovers(only=False)
+
+    def test_successful_worktree_add_interruption_recovers_dirty_review_only(self):
+        self.assert_creation_recovers(only=True)
+
+    def assert_creation_rejects_edits(self, only):
+        run_id, root, before = self.interrupted_creation(only)
+        (root / 'unrelated.txt').write_text('retain unrelated edits')
+        saved = self.report.read_bytes()
+        for _ in range(2):
+            code, value = self.cli('continue', self.report)
+            self.assertNotEqual(code, 0)
+            self.assertIn('adopt', value['reason'])
+            self.assertEqual(self.report.read_bytes(), saved)
+        self.assertNotEqual(self.cli('complete', self.report)[0], 0)
+        self.assertEqual(json.loads(self.report.read_text())['run_id'], run_id)
+        self.assertEqual((root / 'unrelated.txt').read_text(), 'retain unrelated edits')
+        self.assertEqual(factory.snapshot(self.f.repo), before)
+        self.assertEqual(self.f.calls(), [])
+        if only:
+            self.assertNotEqual(self.cli('adopt', self.report, '--reason', 'Retain edits')[0], 0)
+
+    def test_successful_worktree_add_interruption_rejects_unrelated_review_edits(self):
+        self.assert_creation_rejects_edits(only=False)
+
+    def test_successful_worktree_add_interruption_rejects_unrelated_review_only_edits(self):
+        self.assert_creation_rejects_edits(only=True)
+
     def test_tampered_attempt_summary_is_stale(self):
         code, value, report = self.review(only=True)
         self.assertEqual(code, 0, value)

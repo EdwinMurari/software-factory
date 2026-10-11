@@ -626,8 +626,13 @@ class ControllerV2:
         saved_final = final_output / "report.json"
         baseline = (read_json(saved_final)["baseline"] if saved_final.exists()
                     else self.baseline(self.sources, self.output / "original-baselines"))
-        final = Session(self, self.integration, final_output, self.plan["tickets"], baseline).restore()
+        self.verify_final(final_output, baseline)
+
+    def verify_final(self, output, baseline):
+        """Verify and publish the final integration state for every entry mode."""
+        final = Session(self, self.integration, output, self.plan["tickets"], baseline).restore()
         self.final_session = final
+        final.save()
         pending = [item for item in self.report.get("findings", []) if not item.get("resolved")]
         final.verify_integration(pending)
         for item in pending:
@@ -638,7 +643,8 @@ class ControllerV2:
         if any(c["inputs_sha256"] != fingerprint for c in final.report["final_checks"]):
             raise FactoryError("Final integration evidence stale")
         self.report.update(final_inputs=exact, final_checks=final.report["final_checks"], final_review=final.report["final_review"],
-                           integration_attempts=final.report["integration_attempts"], final_processes=final.report["processes"], status="verified")
+                           integration_attempts=final.report["integration_attempts"], final_processes=final.report["processes"],
+                           status="reviewed" if self.review_only else "verified")
         for name, path in self.integration.items():
             self.report["repositories"][name].update(
                 head=os.fsdecode(git(path, "rev-parse", "HEAD")).strip(), inputs=exact[name])
@@ -673,10 +679,15 @@ class ControllerV2:
                     paths |= set(git(source, "ls-tree", "-r", "--name-only", "-z", "HEAD").split(b"\0"))
                     for raw in sorted(paths - {b""}):
                         relative = os.fsdecode(raw)
+                        # Removed HEAD children can now sit below a file or symlink.
+                        # Do not follow the replacement into an external directory.
+                        if any((source / parent).is_symlink() or (source / parent).is_file()
+                               for parent in Path(relative).parents):
+                            continue
                         origin, target = source / relative, path / relative
                         if target.is_symlink() or target.is_file():
                             target.unlink()
-                        elif target.is_dir() and not origin.is_dir():
+                        elif target.is_dir() and (origin.is_symlink() or not origin.is_dir()):
                             shutil.rmtree(target)
                         if not origin.exists() and not origin.is_symlink():
                             continue
@@ -743,22 +754,9 @@ class ControllerV2:
                 patch.write_bytes(b"")
                 baseline[name] = {"head": head, "inputs_sha256": self.source_inputs[name],
                                   "tracked_patch": str(patch), "untracked": []}
-        final = Session(self, self.integration, output, self.plan["tickets"], baseline).restore()
-        self.final_session = final
-        final.save()
-        pending = [f for f in self.report.get("findings", []) if not f.get("resolved")]
-        final.verify_integration(pending)
-        for item in pending:
-            item["resolved"] = True
-        self.unchanged()
-        exact = repository_inputs(self.integration)
-        self.report.update(final_inputs=exact, final_checks=final.report["final_checks"],
-                           final_review=final.report["final_review"], integration_attempts=final.report["integration_attempts"],
-                           final_processes=final.report["processes"], status="reviewed" if self.review_only else "verified")
+        self.verify_final(output, baseline)
         for state in self.report["tickets"].values():
             state["status"] = "reviewed" if self.review_only else "verified"
-        for name, path in self.integration.items():
-            self.report["repositories"][name].update(head=os.fsdecode(git(path, "rev-parse", "HEAD")).strip(), inputs=exact[name])
 
     def investigate_points(self):
         audit = self.plan["_audit"]

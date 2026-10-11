@@ -75,6 +75,34 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual([c['phase'] for c in self.f.calls()], ['final_review'])
         self.assertEqual(self.cli('complete', self.report)[0], 0)
 
+    def test_deleted_tracked_directory_replaced_by_symlink(self):
+        repo = self.f.repo
+        directory = repo / 'directory'
+        directory.mkdir()
+        (directory / 'tracked.txt').write_text('old tracked content')
+        self.f.git(repo, 'add', '.')
+        self.f.git(repo, 'commit', '-qm', 'tracked directory')
+        self.f.git(repo, 'rm', '-r', 'directory')
+        external = self.f.base / 'external'
+        external.mkdir()
+        (external / 'tracked.txt').write_text('external content')
+        directory.symlink_to(external, target_is_directory=True)
+        before = factory.snapshot(repo)
+        self.f.plan['checks'][0]['argv'][-1] = (
+            "from pathlib import Path; assert Path('directory').is_symlink(); "
+            "assert Path('directory/tracked.txt').read_text() == 'external content'")
+        self.f.plan_path.write_text(json.dumps(self.f.plan))
+        code, value, report = self.review(only=True)
+        self.assertEqual(code, 0, value)
+        copy = Path(report['repositories']['app']['worktree'])
+        self.assertEqual(os.readlink(copy / 'directory'), str(external))
+        self.assertEqual((external / 'tracked.txt').read_text(), 'external content')
+        self.assertEqual(factory.snapshot(repo), before)
+        self.assertEqual(self.f.git(copy, 'status', '--short'), self.f.git(repo, 'status', '--short'))
+        self.assertEqual(self.f.git(copy, 'diff', '--cached'), self.f.git(repo, 'diff', '--cached'))
+        self.assertEqual([c['phase'] for c in self.f.calls()], ['final_review'])
+        self.assertEqual(self.cli('complete', self.report)[0], 0)
+
     def test_intent_to_add_preserved_and_flag_change_is_stale(self):
         repo = self.f.repo
         (repo / 'new.txt').write_text('pending content')

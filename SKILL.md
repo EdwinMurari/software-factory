@@ -27,7 +27,7 @@ For an audit, investigate during intake. Preserve every original point and sourc
 Read the deployed guide before invoking the runner:
 
 ```sh
-ssh gl502 'cat /srv/appdata/berry/projects/services/software-factory/afk/README.md'
+ssh gl502 'runner=$(readlink -f /home/berry/.local/bin/berry-afk); cat "$(dirname "$runner")/../README.md"'
 ```
 
 Use one clean repository and its explicit project config. The config selects trusted checks, provider/model and limits. A scaffold contains config and specs; shared steps stay in the installed factory. No central registration, shared queue or service is required. For unattended execution, use a separate transient unit per invocation as the guide describes.

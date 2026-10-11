@@ -66,6 +66,8 @@ test("ready graph runs independent tickets and dependent ticket sees combined st
   let active = 0,
     maxActive = 0;
   const events: { step: string; data: unknown }[] = [];
+  const firstFrontier = new Set<string>();
+  const bothStarted = Promise.withResolvers<void>();
   const runtime = fake(root, async (req) => {
     if (req.role === "planner")
       return JSON.stringify({
@@ -82,8 +84,25 @@ test("ready graph runs independent tickets and dependent ticket sees combined st
       if (id === "c") {
         assert.equal(await readFile(join(req.cwd, "a.txt"), "utf8"), "a");
         assert.equal(await readFile(join(req.cwd, "b.txt"), "utf8"), "b");
+      } else {
+        firstFrontier.add(id);
+        if (firstFrontier.size === 2) bothStarted.resolve();
+        let timeout: ReturnType<typeof setTimeout> | undefined;
+        try {
+          await Promise.race([
+            bothStarted.promise,
+            new Promise<never>((_, reject) => {
+              timeout = setTimeout(
+                () =>
+                  reject(new Error("Independent implementers did not overlap")),
+                60_000,
+              );
+            }),
+          ]);
+        } finally {
+          clearTimeout(timeout);
+        }
       }
-      await new Promise((r) => setTimeout(r, 20));
       await writeFile(join(req.cwd, `${id}.txt`), id);
       active--;
       return '{"status":"done","summary":"implemented"}';

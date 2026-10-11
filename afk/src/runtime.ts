@@ -17,7 +17,10 @@ import {
   mkdtemp,
   writeFile,
   rm,
+  stat,
+  access,
 } from "node:fs/promises";
+import { constants } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
@@ -51,7 +54,16 @@ export function createRuntime(config: RuntimeConfig = {}): Runtime {
         config.stateRoot ??
           join(await repositoryStateRoot(request.cwd), "metadata"),
       );
-      return executeWorker({ ...config, provider, model }, request);
+      const guidance = await resolveStageGuidance(provider);
+      return executeWorker(
+        { ...config, provider, model },
+        {
+          ...request,
+          prompt: guidance
+            ? `${request.prompt}\n\nThe installed ask-matt guidance router is the skill file at ${JSON.stringify(guidance)}. Read that SKILL.md file to select guidance for this stage, then read the selected skill files. ask-matt is a skill file, not a command-line executable. Missing required guidance remains a blocker.`
+            : request.prompt,
+        },
+      );
     },
     async createWorktree(repo, branch) {
       if (
@@ -88,6 +100,35 @@ export function createRuntime(config: RuntimeConfig = {}): Runtime {
         throw new Incomplete("Dirty worktree preserved for recovery");
     },
   };
+}
+
+export async function resolveStageGuidance(
+  provider: "codex" | "claude",
+  home: string = homedir(),
+  environment: NodeJS.ProcessEnv = process.env,
+): Promise<string | undefined> {
+  const configuredRoot =
+    environment[provider === "codex" ? "CODEX_HOME" : "CLAUDE_CONFIG_DIR"];
+  const providerRoot =
+    configuredRoot ?? join(home, provider === "codex" ? ".codex" : ".claude");
+  for (const root of [providerRoot, join(home, ".agents")]) {
+    if (!root.trim()) continue;
+    const candidate = join(root, "skills", "ask-matt", "SKILL.md");
+    try {
+      const path = await realpath(candidate);
+      if (!(await stat(path)).isFile()) continue;
+      await access(path, constants.R_OK);
+      return path;
+    } catch (error) {
+      if (
+        !["ENOENT", "ENOTDIR", "EACCES"].includes(
+          (error as NodeJS.ErrnoException).code ?? "",
+        )
+      )
+        throw error;
+    }
+  }
+  return undefined;
 }
 
 export async function repositoryStateRoot(repo: string): Promise<string> {

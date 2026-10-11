@@ -8,11 +8,12 @@ import {
   access,
   rm,
   realpath,
+  symlink,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
-import { createRuntime } from "../src/runtime.js";
+import { createRuntime, resolveStageGuidance } from "../src/runtime.js";
 
 test("actual Sandcastle library manages execution, failures and worktrees", async () => {
   const root = await mkdtemp(join(tmpdir(), "berry-afk-runtime-"));
@@ -143,6 +144,110 @@ test("actual Sandcastle library manages execution, failures and worktrees", asyn
     process.env.PATH = originalPath;
     if (originalGitConfig === undefined) delete process.env.GIT_CONFIG_GLOBAL;
     else process.env.GIT_CONFIG_GLOBAL = originalGitConfig;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("stage guidance resolves the provider skill file, shared fallback and canonical links", async () => {
+  const root = await mkdtemp(join(tmpdir(), "berry-afk-guidance-"));
+  try {
+    assert.equal(await resolveStageGuidance("codex", root, {}), undefined);
+    const shared = join(root, ".agents", "skills", "ask-matt", "SKILL.md");
+    await mkdir(join(root, ".agents", "skills", "ask-matt"), {
+      recursive: true,
+    });
+    await writeFile(shared, "Shared router guidance");
+    assert.equal(
+      await resolveStageGuidance("codex", root, {}),
+      await realpath(shared),
+    );
+    assert.equal(
+      await resolveStageGuidance("claude", root, {}),
+      await realpath(shared),
+    );
+    const providers = [
+      ["codex", ".codex"],
+      ["claude", ".claude"],
+    ] as const;
+    for (const [provider, directory] of providers) {
+      const target = join(root, `${provider}-router.md`);
+      await writeFile(target, `${provider} router guidance`);
+      const location = join(root, directory, "skills", "ask-matt");
+      await mkdir(location, { recursive: true });
+      await symlink(target, join(location, "SKILL.md"));
+      const path = await resolveStageGuidance(provider, root, {});
+      assert.equal(path, await realpath(target));
+      assert.equal(
+        await readFile(path!, "utf8"),
+        `${provider} router guidance`,
+      );
+    }
+    await rm(join(root, ".codex", "skills", "ask-matt", "SKILL.md"));
+    await mkdir(join(root, ".codex", "skills", "ask-matt", "SKILL.md"));
+    assert.equal(
+      await resolveStageGuidance("codex", root, {}),
+      await realpath(shared),
+      "a directory named SKILL.md cannot hide a usable fallback",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("configured provider homes take precedence without falling back to stale defaults", async () => {
+  const root = await mkdtemp(join(tmpdir(), "berry-afk-guidance-env-"));
+  const providers = [
+    ["codex", ".codex", "CODEX_HOME"],
+    ["claude", ".claude", "CLAUDE_CONFIG_DIR"],
+  ] as const;
+  try {
+    for (const [provider, directory, variable] of providers) {
+      const home = join(root, provider);
+      const configured = join(root, `${provider}-configured`);
+      const standardSkill = join(
+        home,
+        directory,
+        "skills",
+        "ask-matt",
+        "SKILL.md",
+      );
+      const configuredSkill = join(
+        configured,
+        "skills",
+        "ask-matt",
+        "SKILL.md",
+      );
+      for (const path of [standardSkill, configuredSkill]) {
+        await mkdir(join(path, ".."), { recursive: true });
+        await writeFile(path, path);
+      }
+      assert.equal(
+        await resolveStageGuidance(provider, home, {}),
+        await realpath(standardSkill),
+      );
+      assert.equal(
+        await resolveStageGuidance(provider, home, { [variable]: configured }),
+        await realpath(configuredSkill),
+      );
+      const missing = { [variable]: join(root, "not-installed") };
+      assert.equal(
+        await resolveStageGuidance(provider, home, missing),
+        undefined,
+        "an explicit missing provider home cannot use stale default guidance",
+      );
+      const shared = join(home, ".agents", "skills", "ask-matt", "SKILL.md");
+      await mkdir(join(shared, ".."), { recursive: true });
+      await writeFile(shared, "Shared installed router");
+      assert.equal(
+        await resolveStageGuidance(provider, home, missing),
+        await realpath(shared),
+      );
+      assert.equal(
+        await resolveStageGuidance(provider, home, { [variable]: "" }),
+        await realpath(shared),
+      );
+    }
+  } finally {
     await rm(root, { recursive: true, force: true });
   }
 });

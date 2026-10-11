@@ -149,7 +149,6 @@ export async function executeJob(
       await command(target, "git", ["branch", "--show-current"], signal)
     ).output.trim(),
     delivery: "Retained branch/worktree; controller has no push or deploy step",
-    historicalExternalActions: "Not attested by noSandbox",
   };
   sink("controller-gates", controllerEvidence);
   const result = await reviewRepair(

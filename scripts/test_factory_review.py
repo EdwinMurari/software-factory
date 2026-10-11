@@ -57,6 +57,66 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(Path(baseline['tracked_patch']).read_bytes(), b'')
         self.assertEqual(self.cli('complete', self.report)[0], 0)
 
+    def test_deleted_tracked_file_replaced_by_directory(self):
+        repo = self.f.repo
+        self.f.git(repo, 'rm', 'existing.txt')
+        (repo / 'existing.txt').mkdir()
+        (repo / 'existing.txt' / 'child.txt').write_text('replacement child')
+        self.f.plan['checks'][0]['argv'][-1] = (
+            "from pathlib import Path; assert Path('existing.txt/child.txt').read_text() == 'replacement child'")
+        self.f.plan_path.write_text(json.dumps(self.f.plan))
+        before = factory.snapshot(repo)
+        code, value, report = self.review()
+        self.assertEqual(code, 0, value)
+        copy = Path(report['repositories']['app']['worktree'])
+        self.assertEqual((copy / 'existing.txt/child.txt').read_text(), 'replacement child')
+        self.assertEqual(factory.snapshot(repo), before)
+        self.assertEqual(self.f.git(copy, 'status', '--short'), self.f.git(repo, 'status', '--short'))
+        self.assertEqual([c['phase'] for c in self.f.calls()], ['final_review'])
+        self.assertEqual(self.cli('complete', self.report)[0], 0)
+
+    def test_intent_to_add_preserved_and_flag_change_is_stale(self):
+        repo = self.f.repo
+        (repo / 'new.txt').write_text('pending content')
+        (repo / 'pending executable').write_text('run')
+        (repo / 'pending executable').chmod(0o755)
+        (repo / 'pending link').symlink_to('new.txt')
+        (repo / 'pending\nname').write_text('path with newline')
+        (repo / 'deleted pending').write_text('removed later')
+        self.f.git(repo, 'add', '-N', '.')
+        (repo / 'deleted pending').unlink()
+        self.f.git(repo, 'update-index', '--assume-unchanged', 'existing.txt')
+        before = factory.snapshot(repo)
+        code, value, report = self.review(only=True)
+        self.assertEqual(code, 0, value)
+        copy = Path(report['repositories']['app']['worktree'])
+        self.assertEqual(self.f.git(copy, 'status', '--short'), self.f.git(repo, 'status', '--short'))
+        self.assertEqual(self.f.git(copy, 'diff', '--cached', '--name-status'), b'')
+        self.assertEqual(self.f.git(copy, 'diff'), self.f.git(repo, 'diff'))
+        self.assertEqual(factory.snapshot(repo), before)
+        self.assertEqual(self.cli('complete', self.report)[0], 0)
+        # Keep the blob and mode, but clear intent-to-add.
+        self.f.git(copy, 'update-index', '--cacheinfo',
+                   '100644,e69de29bb2d1d6434b8b29ae775ad8c2e48c5391,new.txt')
+        self.assertNotEqual(self.cli('complete', self.report)[0], 0)
+        self.assertEqual(self.cli('status', self.report)[1]['status'], 'stale')
+
+    def test_failed_initial_check_is_reviewed_before_repair(self):
+        self.f.plan['checks'][0]['argv'][-1] = "from pathlib import Path; assert Path('fix.txt').exists()"
+        self.f.plan_path.write_text(json.dumps(self.f.plan))
+        before = factory.snapshot(self.f.repo)
+        code, value, report = self.review()
+        self.assertEqual(code, 0, value)
+        calls = self.f.calls()
+        self.assertEqual([c['phase'] for c in calls],
+                         ['final_review', 'integration_repair', 'final_review'])
+        initial = report['integration_attempts'][0]
+        self.assertEqual(initial['checks'][0]['status'], 'failed')
+        self.assertEqual(calls[0]['request']['evidence'][0]['status'], 'failed')
+        self.assertTrue(all(c['status'] == 'passed' for c in report['final_checks']))
+        self.assertEqual(factory.snapshot(self.f.repo), before)
+        self.assertEqual(self.cli('complete', self.report)[0], 0)
+
     def test_findings_repair_then_fresh_review(self):
         self.configure(findings=True)
         code, value, report = self.review()
@@ -67,6 +127,21 @@ class ReviewTests(unittest.TestCase):
         self.assertNotIn('Missing fix.txt', json.dumps(calls[-1]['request']['evidence']))
         self.assertTrue((Path(report['repositories']['app']['worktree']) / 'fix.txt').exists())
         self.assertFalse((self.f.repo / 'fix.txt').exists())
+        self.assertEqual(self.cli('complete', self.report)[0], 0)
+
+    def test_interrupted_failed_checks_still_receive_initial_review(self):
+        self.f.plan['checks'][0]['argv'][-1] = "from pathlib import Path; assert Path('fix.txt').exists()"
+        self.f.plan_path.write_text(json.dumps(self.f.plan))
+        self.register()
+        owner = factory_v2.ControllerV2(self.f.plan_path, self.output, resume=True)
+        with patch.object(factory_v2.Session, 'worker', side_effect=OSError('review dispatch interrupted')):
+            value = owner.run()
+        self.assertEqual(value['status'], 'incomplete')
+        self.assertEqual(self.f.calls(), [])
+        code, value = self.cli('continue', self.report)
+        self.assertEqual(code, 0, value)
+        self.assertEqual([c['phase'] for c in self.f.calls()],
+                         ['final_review', 'integration_repair', 'final_review'])
         self.assertEqual(self.cli('complete', self.report)[0], 0)
 
     def test_report_only_findings_and_stale_evidence(self):
@@ -155,9 +230,12 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(self.cli('close', self.report, '--reason', 'replace agreement')[0], 0)
 
     def test_product_blocker_cannot_disappear_on_lucky_retry(self):
+        self.f.plan['checks'][0]['argv'][-1] = "from pathlib import Path; assert Path('fix.txt').exists()"
+        self.f.plan_path.write_text(json.dumps(self.f.plan))
         self.configure(pending=True)
         code, value, report = self.review()
         self.assertNotEqual(code, 0)
+        self.assertEqual([c['phase'] for c in self.f.calls()], ['final_review'])
         calls = len(self.f.calls())
         self.configure()
         self.assertNotEqual(self.cli('continue', self.report)[0], 0)

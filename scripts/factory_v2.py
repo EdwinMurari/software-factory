@@ -16,7 +16,7 @@ import uuid
 from typing import ContextManager
 
 from factory import (Controller, ExecutionInputs, FactoryError, capture_baseline, digest, encoded, git,
-                     identifier, keys, now, positive, read_json, snapshot,
+                     identifier, index_flags, keys, now, positive, read_json, snapshot,
                      strings, text, validate_v1, validate_result, repository_lock_path)
 from factory_audit import (INVESTIGATION_SCHEMA, audit_input, execution_intake,
                            investigation_result, reference, references_unchanged)
@@ -685,8 +685,34 @@ class ControllerV2:
                             target.symlink_to(os.readlink(origin))
                         elif origin.is_file():
                             shutil.copy2(origin, target)
+                        elif origin.is_dir():
+                            # A removed HEAD file can now contain listed children.
+                            target.mkdir(exist_ok=True)
                         else:
                             raise FactoryError("Unsupported review input: " + str(origin))
+                    for relative, flags in index_flags(source):
+                        if flags & 0x20000000:
+                            target = path / relative
+                            missing = not target.exists() and not target.is_symlink()
+                            if missing:
+                                target.parent.mkdir(parents=True, exist_ok=True)
+                                entry = git(source, "ls-files", "--stage", "--", relative)
+                                if entry.startswith(b"120000 "):
+                                    target.symlink_to("intent-to-add-placeholder")
+                                else:
+                                    target.touch()
+                                    if entry.startswith(b"100755 "):
+                                        target.chmod(0o755)
+                            try:
+                                git(path, "update-index", "--force-remove", "--", relative)
+                                git(path, "add", "--intent-to-add", "--", relative)
+                            finally:
+                                if missing:
+                                    target.unlink()
+                        if flags & 0x40000000:
+                            git(path, "update-index", "--skip-worktree", "--", relative)
+                        if flags & 0x8000:
+                            git(path, "update-index", "--assume-unchanged", "--", relative)
                 finally:
                     # Retain the last controller-owned copy state even if a file
                     # operation is interrupted. Continuation resumes this seed;

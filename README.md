@@ -1,10 +1,16 @@
 # Software Factory
 
-Give Codex or Claude Code either input:
+Give Codex or Claude Code a build, audit, or review request:
 
 > Use the software factory to build [desired product outcome].
 
 > Use the software factory to investigate and improve [audit points and sources].
+
+> Use software factory to review current work against [baseline] and fix findings.
+
+> Review only: use software factory to review current work against [baseline] and report findings without changing code.
+
+Pin the review baseline to a full commit ID. Supply the approved requirements for repairs. If requirements are missing, review only reports that limitation. Material product decisions still need your choice.
 
 You choose product behaviour, one material decision at a time. The agent uses the installed `ask-matt` router for existing skills, records your decisions, and prepares tasks. Investigation findings never approve a change. This repository keeps no second Matt skill catalogue.
 

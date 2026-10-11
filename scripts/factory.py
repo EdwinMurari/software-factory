@@ -119,6 +119,21 @@ def repository_lock_path(project):
     return Path(tempfile.gettempdir()) / f"software-factory-{os.getuid()}-{digest(os.fsencode(directory))[:24]}.lock"
 
 
+def index_flags(project):
+    """Read semantic index flags without hashing volatile stat-cache data."""
+    remaining = git(project, "ls-files", "--debug", "-z")
+    flags = []
+    while remaining:
+        path, remaining = remaining.split(b"\0", 1)
+        # Git emits five stat-cache lines after each NUL-terminated path.
+        *metadata, remaining = remaining.split(b"\n", 5)
+        value = int(metadata[-1].split(b"flags: ", 1)[1], 16)
+        value &= 0x60008000  # intent-to-add, skip-worktree, assume-unchanged
+        if value:
+            flags.append([os.fsdecode(path), value])
+    return flags
+
+
 def snapshot(project, content_only=False):
     """Hash index entries, HEAD and all tracked/nonignored worktree inputs.
 
@@ -146,7 +161,8 @@ def snapshot(project, content_only=False):
             records.append([os.fsdecode(raw), "deleted"])
         except OSError as exc:
             raise FactoryError(f"Cannot fingerprint {path}: {exc}") from exc
-    return digest(encoded(records if content_only else {"head": head.decode().strip(), "index": digest(index), "files": records}))
+    return digest(encoded(records if content_only else {"head": head.decode().strip(), "index": digest(index),
+                                                       "index_flags": index_flags(project), "files": records}))
 
 
 def load_plan(path):
@@ -712,6 +728,7 @@ class Controller:
         if self.report.get("integration_validation_stop"):
             raise FactoryError(self.report["integration_validation_stop"])
         required = [c for tid in self.order for c in self.tickets[tid]["checks"]]
+        review_existing = self.plan.get("input", {}).get("kind") == "review"
         self.report.setdefault("integration_attempts", [])
         seen = set(self.report.get("integration_progress_inputs", []))
         evidence = []
@@ -739,7 +756,8 @@ class Controller:
             same_inputs = checks and all(c.get("inputs_sha256") == current for c in checks)
             if same_inputs and review and review["status"] == "changes_requested":
                 evidence += [{"review": review, "checks": self.failure_evidence(checks)}]
-            elif same_inputs and any(c["status"] == "failed" for c in checks):
+            elif (same_inputs and any(c["status"] == "failed" for c in checks)
+                  and (review is not None or not review_existing)):
                 evidence += self.failure_evidence(checks)
         review_only = self.plan.get("input", {}).get("review_only", False)
         if review_only:
@@ -782,7 +800,8 @@ class Controller:
                     self.report["integration_validation_stop"] = message
                     self.save()
                 raise FactoryError(message)
-            if not all(c["status"] == "passed" for c in checks) and not review_only:
+            checks_passed = all(c["status"] == "passed" for c in checks)
+            if not checks_passed and not review_only and not review_existing:
                 evidence = self.failure_evidence(checks)
                 continue
             try:
@@ -796,15 +815,16 @@ class Controller:
             self.save()
             if review_only and review["status"] != "blocked":
                 break
-            if self.review_complete(review):
+            if self.review_complete(review) and checks_passed:
                 break
-            if review["status"] != "changes_requested":
+            if not self.review_complete(review) and review["status"] != "changes_requested":
                 message = "Final review blocked or acceptance remains pending"
                 if self.plan.get("input", {}).get("kind") == "review":
                     self.report["integration_validation_stop"] = message
                     self.save()
                 raise FactoryError(message)
-            evidence = [{"review": review, "checks": self.failure_evidence(checks)}]
+            evidence = ([{"review": review, "checks": self.failure_evidence(checks)}]
+                        if review["status"] == "changes_requested" else self.failure_evidence(checks))
         else:
             raise FactoryError("Integration exhausted its bounded attempts")
 

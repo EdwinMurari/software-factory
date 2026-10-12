@@ -12,6 +12,17 @@ export interface Check {
   args: string[];
   integrity?: FileIntegrity[];
 }
+export interface PreflightProbe {
+  id: string;
+  command: string;
+  args: string[];
+  required?: boolean;
+  timeoutMs?: number;
+}
+export interface PreflightConfig {
+  probes?: PreflightProbe[];
+  mcpServers?: { name: string; required?: boolean }[];
+}
 export interface RepositoryConfig {
   root: string;
   standards: string;
@@ -25,6 +36,7 @@ export interface RepositoryConfig {
   maxTickets: number;
   maxConcurrency: number;
   timeoutMs: number;
+  preflight?: PreflightConfig;
 }
 export interface Ticket {
   id: string;
@@ -77,6 +89,24 @@ export interface CheckEvidence {
     after: FileIntegrity;
     unchanged: boolean;
   }[];
+}
+export interface TicketProvenance {
+  id: string;
+  branch: string;
+  worktree: string;
+  base: string;
+  head: string;
+  picks: { source: string; picked: string }[];
+}
+export interface RunProvenance {
+  version: 1;
+  runId: string;
+  repository: string;
+  flow: Flow;
+  baseline: string;
+  outputHead: string;
+  integration: { branch: string; worktree: string };
+  tickets: TicketProvenance[];
 }
 export interface EvidenceSink {
   (step: string, data: unknown): void;

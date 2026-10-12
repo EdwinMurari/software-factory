@@ -34,7 +34,13 @@ Use one clean repository and its explicit project config. The config selects tru
 
 Copy the approved spec to the host, then start the CLI with `run --config FILE --spec FILE --flow FLOW`. Record the unique run directory printed at startup. Follow that instance with `status RUN_DIRECTORY`; cancel it with `cancel RUN_DIRECTORY`. Both review flows require `--baseline FULL_40_CHARACTER_COMMIT_SHA`. Multiple runs can use the same project with separate worktrees and evidence. Worktrees do not provide a sandbox.
 
-Report the run directory and durable status. Completion requires the runner's complete result plus observed acceptance evidence. The pipeline retains its output branch/worktree; it has no push or deployment step.
+Report the run directory and durable status. Completion requires the runner's complete result plus observed acceptance evidence. A run retains its output branch/worktree and never merges, pushes or deploys by itself. A required-tool preflight runs first; a `blocked` run names the missing tool. `berry-afk preflight --config FILE` inspects tools read-only.
+
+## Merge and clean up
+
+Route a natural-language request such as "use software factory to merge this into main" to `berry-afk merge RUN_DIRECTORY` for the named completed run. Require the user's actual merge authorization, in this request or a durable earlier one; an approved spec or a passing run alone is not authorization. This delivers to **local `main` only**. Push, release and deploy need their own authorization and are never implied.
+
+Report the JSON `status`. For `merge-failed`, give the reason and say a verified merge was not established. Report any retained candidate worktree. For `merged-cleanup-pending`, report the verified merge and the failure reason, plus retained worktrees or branches when listed. Never describe cleanup as complete unless the status is `merged-cleanup-complete`. Use `berry-afk cleanup RUN_DIRECTORY` to reconcile a run merged outside the factory. Retry after the cause is fixed; both commands are repeatable. Do not delete retained work by hand to make cleanup complete. The deployed guide has the exact rules.
 
 ## Scope and stops
 

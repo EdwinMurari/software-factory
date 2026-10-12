@@ -12,9 +12,10 @@ const stop = () => {
 process.once("disconnect", stop);
 if (!process.connected) stop();
 
-process.once("message", ({ cwd, exe, args }) => {
+process.once("message", ({ cwd, exe, args, env }) => {
   const child = spawn(exe, args, {
     cwd,
+    env: env ?? process.env,
     stdio: ["ignore", "inherit", "inherit"],
   });
   child.once("error", (error) => {

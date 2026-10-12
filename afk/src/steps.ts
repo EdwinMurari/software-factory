@@ -142,7 +142,7 @@ export async function integrate(
   const dirty = await command(
     ticketRoot,
     "git",
-    ["status", "--porcelain"],
+    ["status", "--porcelain", "--untracked-files=all"],
     signal,
   );
   let r = { code: 0, output: "" };
@@ -179,6 +179,7 @@ export async function integrate(
     signal,
     "machine",
   );
+  const picks: { source: string; picked: string }[] = [];
   for (const commit of commits.output.trim().split("\n").filter(Boolean)) {
     r = await command(
       target,
@@ -194,9 +195,42 @@ export async function integrate(
       signal,
     );
     if (r.code) throw new Incomplete("Integration conflict; worktree retained");
+    // Cherry-picks get new IDs; record the pair so inclusion can be proved later.
+    const picked = await command(target, "git", ["rev-parse", "HEAD"], signal);
+    picks.push({ source: commit, picked: picked.output.trim() });
   }
   const head = await command(ticketRoot, "git", ["rev-parse", "HEAD"], signal);
-  return { status: "done", summary: head.output.trim() };
+  return {
+    status: "done",
+    summary: head.output.trim(),
+    head: head.output.trim(),
+    picks,
+  };
+}
+export async function commitAccepted(cwd: string, signal?: AbortSignal) {
+  const dirty = await command(cwd, "git", ["status", "--porcelain", "--untracked-files=all"], signal);
+  if (dirty.code) throw new Incomplete("Cannot read accepted output state");
+  if (dirty.output.trim()) {
+    let r = await command(cwd, "git", ["add", "-A"], signal);
+    if (r.code) throw new Incomplete("Cannot stage accepted output");
+    r = await command(
+      cwd,
+      "git",
+      [
+        "-c",
+        "user.name=Berry AFK",
+        "-c",
+        "user.email=berry-afk@localhost",
+        "commit",
+        "-m",
+        "Accept reviewed AFK result",
+      ],
+      signal,
+    );
+    if (r.code) throw new Incomplete("Cannot commit accepted output");
+  }
+  const head = await command(cwd, "git", ["rev-parse", "HEAD"], signal);
+  return head.output.trim();
 }
 export async function publish(cwd: string, signal?: AbortSignal) {
   const branch = await command(

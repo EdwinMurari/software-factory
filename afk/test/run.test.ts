@@ -1,5 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import crypto from "node:crypto";
+import { syncBuiltinESMExports } from "node:module";
 import {
   mkdtemp,
   mkdir,
@@ -9,6 +12,7 @@ import {
   rm,
   stat,
   symlink,
+  readdir,
 } from "node:fs/promises";
 import { spawn, execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
@@ -19,12 +23,92 @@ import {
   runStatus,
   cancelRun,
   validateInput,
+  atomic,
   type RunRecord,
 } from "../src/run.js";
 import { validateConfig } from "../src/config.js";
+import { installProviders } from "./provider.js";
 
 const cli = fileURLToPath(new URL("../src/cli.ts", import.meta.url));
 const tsx = fileURLToPath(import.meta.resolve("tsx"));
+
+test("atomic replacement keeps JSON formatting and removes its temporary file", async () => {
+  const root = await mkdtemp(join(tmpdir(), "afk-atomic-"));
+  const destination = join(root, "status.json");
+  try {
+    await writeFile(destination, "old record\n");
+    atomic(destination, { status: "complete" });
+    assert.equal(await readFile(destination, "utf8"), '{\n  "status": "complete"\n}\n');
+    assert.equal((await stat(destination)).mode & 0o777, 0o600);
+    assert.deepEqual(await readdir(root), ["status.json"]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("failed atomic rename removes its temporary file and preserves the destination", async () => {
+  const root = await mkdtemp(join(tmpdir(), "afk-atomic-"));
+  const destination = join(root, "delivery.json");
+  try {
+    await mkdir(destination);
+    await writeFile(join(destination, "user.txt"), "preserved\n");
+    await writeFile(join(root, "foreign.tmp"), "unrelated\n");
+
+    assert.throws(() => atomic(destination, { status: "complete" }));
+
+    assert.deepEqual((await readdir(root)).sort(), ["delivery.json", "foreign.tmp"]);
+    assert.equal(await readFile(join(destination, "user.txt"), "utf8"), "preserved\n");
+    assert.equal(await readFile(join(root, "foreign.tmp"), "utf8"), "unrelated\n");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("failed atomic write removes its partial file and preserves the destination", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "afk-atomic-"));
+  const destination = join(root, "status.json");
+  const write = fs.writeFileSync;
+  try {
+    await writeFile(destination, "original\n");
+    t.mock.method(fs, "writeFileSync", (...args: Parameters<typeof fs.writeFileSync>) => {
+      write(args[0], "partial", args[2]);
+      throw Object.assign(new Error("disk full"), { code: "ENOSPC" });
+    });
+    syncBuiltinESMExports();
+
+    assert.throws(() => atomic(destination, { status: "complete" }), { code: "ENOSPC" });
+
+    assert.deepEqual(await readdir(root), ["status.json"]);
+    assert.equal(await readFile(destination, "utf8"), "original\n");
+  } finally {
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("atomic create collision preserves the pre-existing temporary file", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "afk-atomic-"));
+  const destination = join(root, "status.json");
+  const id = "00000000-0000-4000-8000-000000000000";
+  const temporary = `${destination}.${id}.tmp`;
+  try {
+    await writeFile(destination, "original\n");
+    await writeFile(temporary, "foreign work\n");
+    t.mock.method(crypto, "randomUUID", () => id);
+    syncBuiltinESMExports();
+
+    assert.throws(() => atomic(destination, { status: "complete" }), { code: "EEXIST" });
+
+    assert.equal(await readFile(destination, "utf8"), "original\n");
+    assert.equal(await readFile(temporary, "utf8"), "foreign work\n");
+  } finally {
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 async function fixture() {
   const root = await realpath(await mkdtemp(join(tmpdir(), "afk-instances-")));
   const repo = join(root, "repo"),
@@ -77,26 +161,8 @@ async function fixture() {
   };
   await writeFile(join(root, "config.json"), JSON.stringify(config));
   await writeFile(join(root, "spec.md"), "Preserve source");
-  await writeFile(
-    join(bin, "codex"),
-    `#!${process.execPath}
-const fs = require('node:fs');
-let prompt = '';
-process.stdin.on('data', chunk => prompt += chunk);
-process.stdin.on('end', () => {
- fs.writeFileSync(process.env.FIXTURE_READY, String(process.pid));
- const finish = () => {
-  if(process.env.FIXTURE_RELEASE && !fs.existsSync(process.env.FIXTURE_RELEASE)) return setTimeout(finish, 50);
-  if(process.env.FIXTURE_FAILURE) { console.error('401 authentication failed'); process.exit(1); }
-  const response = {findings: process.env.FIXTURE_FINDING ? [{id:'one',file:'source.txt',description:'fixture finding',repair:'repair fixture'}] : [], blockers: [], coverage:[{criterion:'Preserve source', evidence:'Observed source check', status:'verified'}]};
-  console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',text:'<berry_result>'+JSON.stringify(response)+'</berry_result>'}}));
- };
- setTimeout(finish, Number(process.env.FIXTURE_DELAY || 0));
-});
-`,
-    { mode: 0o700 },
-  );
-  return { root, repo, bin, baseline, config };
+  const providers = await installProviders(root, bin);
+  return { root, repo, bin, baseline, config, providers };
 }
 function launch(
   f: Awaited<ReturnType<typeof fixture>>,
@@ -124,7 +190,7 @@ function launch(
     {
       env: {
         ...process.env,
-        PATH: `${f.bin}:${process.env.PATH}`,
+        ...f.providers,
         GIT_CONFIG_GLOBAL: join(f.root, "gitconfig"),
         FIXTURE_READY: join(f.root, `${name}.ready`),
         ...env,

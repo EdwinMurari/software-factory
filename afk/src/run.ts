@@ -7,14 +7,18 @@ import {
   appendFileSync,
   existsSync,
   realpathSync,
+  openSync,
+  closeSync,
+  rmSync,
 } from "node:fs";
 import { join, resolve, dirname, basename } from "node:path";
 import { hostname } from "node:os";
-import type { Flow, RepositoryConfig } from "./contracts.js";
+import type { Flow, RepositoryConfig, Runtime } from "./contracts.js";
 import { Blocked, Incomplete } from "./contracts.js";
 import { executeJob } from "./engine.js";
 import { createRuntime, repositoryStateRoot } from "./runtime.js";
 import { hash, isWithin } from "./source.js";
+import { preflight, unavailableRunStorage } from "./preflight.js";
 
 export interface RunInput {
   spec: string;
@@ -57,15 +61,24 @@ export function validateInput(raw: unknown): RunInput {
     ...(input.baseline ? { baseline: input.baseline.toLowerCase() } : {}),
   };
 }
-function atomic(path: string, data: unknown) {
+export function atomic(path: string, data: unknown) {
   const temporary = `${path}.${randomUUID()}.tmp`;
-  writeFileSync(temporary, JSON.stringify(data, null, 2) + "\n", {
-    mode: 0o600,
-    flag: "wx",
-  });
-  renameSync(temporary, path);
+  const contents = JSON.stringify(data, null, 2) + "\n";
+  // A failed exclusive create does not give us ownership of an existing file.
+  const file = openSync(temporary, "wx", 0o600);
+  try {
+    try {
+      writeFileSync(file, contents);
+    } finally {
+      closeSync(file);
+    }
+    renameSync(temporary, path);
+  } catch (error) {
+    rmSync(temporary, { force: true });
+    throw error;
+  }
 }
-function readRecord(directory: string): RunRecord {
+export function readRecord(directory: string): RunRecord {
   const record = JSON.parse(
     readFileSync(join(directory, "status.json"), "utf8"),
   ) as RunRecord;
@@ -118,73 +131,84 @@ export async function runInstance(
   config: RepositoryConfig,
   output?: string,
   started: (record: RunRecord) => void = () => {},
+  runtime?: Runtime,
 ) {
   input = validateInput(input);
   config = structuredClone(config);
   const stateRoot = await repositoryStateRoot(config.root);
   const parent = resolve(output ?? join(stateRoot, "runs"));
-  // Resolve existing ancestors before creating anything, including through symlinks.
-  let ancestor = parent;
-  const missing: string[] = [];
-  let canonicalParent: string;
-  for (;;) {
+  const runId = randomUUID();
+  const { record, runDirectory, heartbeat } = (() => {
     try {
-      canonicalParent = resolve(realpathSync(ancestor), ...missing);
-      break;
+      // Resolve existing ancestors before creating anything, including through symlinks.
+      let ancestor = parent;
+      const missing: string[] = [];
+      let canonicalParent: string;
+      for (;;) {
+        try {
+          canonicalParent = resolve(realpathSync(ancestor), ...missing);
+          break;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+          missing.unshift(basename(ancestor));
+          ancestor = dirname(ancestor);
+        }
+      }
+      if (
+        isWithin(config.root, canonicalParent) &&
+        !isWithin(stateRoot, canonicalParent)
+      )
+        throw new Error(
+          "Output must be outside source or inside the repository Git state directory",
+        );
+      mkdirSync(canonicalParent, { recursive: true, mode: 0o700 });
+      const runDirectory = join(canonicalParent, runId);
+      mkdirSync(runDirectory, { mode: 0o700 });
+      const now = new Date().toISOString();
+      const record: RunRecord = {
+        runId,
+        runDirectory,
+        status: "running",
+        startedAt: now,
+        updatedAt: now,
+        pid: process.pid,
+        host: hostname(),
+      };
+      const snapshot = JSON.stringify(config, null, 2) + "\n";
+      writeFileSync(join(runDirectory, "spec.md"), input.spec, {
+        mode: 0o400,
+        flag: "wx",
+      });
+      writeFileSync(join(runDirectory, "config.json"), snapshot, {
+        mode: 0o400,
+        flag: "wx",
+      });
+      writeFileSync(
+        join(runDirectory, "input.json"),
+        JSON.stringify(
+          {
+            ...input,
+            spec: undefined,
+            specSha256: hash(input.spec),
+            configSha256: hash(snapshot),
+          },
+          null,
+          2,
+        ) + "\n",
+        { mode: 0o400, flag: "wx" },
+      );
+      const heartbeat = () =>
+        atomic(join(runDirectory, "heartbeat.json"), { runId, at: Date.now() });
+      heartbeat();
+      atomic(join(runDirectory, "status.json"), record);
+      return { record, runDirectory, heartbeat };
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      missing.unshift(basename(ancestor));
-      ancestor = dirname(ancestor);
+      // Preserve argument errors; filesystem failures use the startup blocked report.
+      if (error instanceof Error && typeof (error as NodeJS.ErrnoException).code === "string")
+        throw unavailableRunStorage(config, error);
+      throw error;
     }
-  }
-  if (
-    isWithin(config.root, canonicalParent) &&
-    !isWithin(stateRoot, canonicalParent)
-  )
-    throw new Error(
-      "Output must be outside source or inside the repository Git state directory",
-    );
-  mkdirSync(canonicalParent, { recursive: true, mode: 0o700 });
-  const runId = randomUUID(),
-    runDirectory = join(canonicalParent, runId);
-  mkdirSync(runDirectory, { mode: 0o700 });
-  const now = new Date().toISOString();
-  const record: RunRecord = {
-    runId,
-    runDirectory,
-    status: "running",
-    startedAt: now,
-    updatedAt: now,
-    pid: process.pid,
-    host: hostname(),
-  };
-  const snapshot = JSON.stringify(config, null, 2) + "\n";
-  writeFileSync(join(runDirectory, "spec.md"), input.spec, {
-    mode: 0o400,
-    flag: "wx",
-  });
-  writeFileSync(join(runDirectory, "config.json"), snapshot, {
-    mode: 0o400,
-    flag: "wx",
-  });
-  writeFileSync(
-    join(runDirectory, "input.json"),
-    JSON.stringify(
-      {
-        ...input,
-        spec: undefined,
-        specSha256: hash(input.spec),
-        configSha256: hash(snapshot),
-      },
-      null,
-      2,
-    ) + "\n",
-    { mode: 0o400, flag: "wx" },
-  );
-  const heartbeat = () =>
-    atomic(join(runDirectory, "heartbeat.json"), { runId, at: Date.now() });
-  heartbeat();
-  atomic(join(runDirectory, "status.json"), record);
+  })();
   const controller = new AbortController();
   const cancel = () => controller.abort(new Incomplete("Run cancelled"));
   const timedOut = () =>
@@ -212,15 +236,27 @@ export async function runInstance(
   try {
     sink("started", { runId, flow: input.flow, baseline: input.baseline });
     started(record);
+    // Required tools are proven before any worktree or model call exists.
+    const report = await preflight(config, {
+      mode: "startup",
+      runDirectory,
+      signal: controller.signal,
+    });
+    sink("preflight", report);
+    if (report.status === "blocked")
+      throw new Blocked(
+        `Required tools unavailable: ${report.blockers.join("; ")}`,
+      );
     const result = await executeJob(
       runId,
       input.spec,
       input.flow,
       config,
-      createRuntime({
-        ...config.worker,
-        stateRoot: join(stateRoot, "metadata"),
-      }),
+      runtime ??
+        createRuntime({
+          ...config.worker,
+          stateRoot: join(stateRoot, "metadata"),
+        }),
       sink,
       controller.signal,
       input.baseline,

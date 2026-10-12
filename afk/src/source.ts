@@ -17,6 +17,8 @@ export async function command(
   args: string[],
   signal?: AbortSignal,
   capture: "log" | "machine" = "log",
+  env?: NodeJS.ProcessEnv,
+  options: { maxOutputBytes?: number; onStdout?: (chunk: Buffer) => void } = {},
 ): Promise<{ code: number; output: string }> {
   signal?.throwIfAborted();
   return new Promise((done, reject) => {
@@ -32,24 +34,37 @@ export async function command(
     let output = "";
     let resultCode: number | undefined;
     let failure: Error | undefined;
+    let stopSent = false;
     const machine: Buffer[] = [];
+    let capturedBytes = 0;
     const append = (b: Buffer) => {
       output = (output + b.toString()).slice(-32000);
     };
     const kill = () => {
-      if (child.pid) {
+      if (child.pid && !stopSent) {
         try {
           process.kill(-child.pid, "SIGKILL");
+          stopSent = true;
         } catch (e) {
-          if ((e as NodeJS.ErrnoException).code !== "ESRCH") reject(e);
+          if ((e as NodeJS.ErrnoException).code === "ESRCH") stopSent = true;
+          else reject(e);
         }
       }
     };
     const abort = () => kill();
     signal?.addEventListener("abort", abort, { once: true });
-    child.stdout!.on("data", (chunk: Buffer) =>
-      capture === "machine" ? machine.push(chunk) : append(chunk),
-    );
+    child.stdout!.on("data", (chunk: Buffer) => {
+      capturedBytes += chunk.length;
+      if (options.maxOutputBytes !== undefined && capturedBytes > options.maxOutputBytes) {
+        failure = new Incomplete("Command output limit exceeded");
+        kill();
+        return;
+      }
+      try { options.onStdout?.(chunk); }
+      catch (error) { failure = error as Error; kill(); return; }
+      if (capture === "machine") machine.push(chunk);
+      else append(chunk);
+    });
     child.stderr!.on("data", append);
     child.on("error", (error) => {
       signal?.removeEventListener("abort", abort);
@@ -90,7 +105,7 @@ export async function command(
               : output,
         });
     });
-    child.send({ cwd, exe, args }, (error) => {
+    child.send({ cwd, exe, args, env }, (error) => {
       if (error) {
         failure = error;
         kill();
@@ -99,9 +114,23 @@ export async function command(
     if (signal?.aborted) abort();
   });
 }
+// Match the full JSON string, including escaped quotes, before the plain-text
+// sanitizer. Otherwise a closing key quote prevents credential detection.
+const jsonSecretPattern =
+  /("(?:[^"\\]*[_-])?(?:api[_-]?key|token|password|secret)"\s*:\s*)"(?:\\[\s\S]|[^"\\])*(?:"|$)/gi;
+const secretPattern =
+  /(Bearer\s+|(?:api[_-]?key|token|password|secret)\s*[=:]\s*)[^\s]+|\b(?:sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9]{16,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]*)/gi;
+export function redact(text: string): string {
+  return text
+    .replace(jsonSecretPattern, '$1"[redacted]"')
+    .replace(secretPattern, (match, prefix?: string) =>
+      prefix ? `${prefix}[redacted]` : "[redacted]",
+    );
+}
 export async function sourceHash(
   root: string,
   signal?: AbortSignal,
+  semantics: "filesystem" | "git" = "filesystem",
 ): Promise<string> {
   const listed = await command(
     root,
@@ -119,10 +148,14 @@ export async function sourceHash(
     if (!isWithin(root, full)) throw new Incomplete("Source escapes root");
     try {
       const stat = await lstat(full);
+      // Review guards retain every permission bit. Across Git checkouts only
+      // file kind, owner-executable bit, content and symlink target are portable.
+      const mode = semantics === "filesystem" ? String(stat.mode)
+        : stat.isSymbolicLink() ? "120000" : stat.mode & 0o100 ? "100755" : "100644";
       pieces.push(
         path +
           "\0" +
-          String(stat.mode) +
+          mode +
           "\0" +
           (stat.isSymbolicLink()
             ? "link:" + (await readlink(full))
@@ -246,12 +279,7 @@ export async function checkSource(
           };
         }),
       ),
-      output: r.output
-        .slice(-32000)
-        .replace(
-          /(Bearer\s+|(?:api[_-]?key|token|password)\s*[=:]\s*)[^\s]+/gi,
-          "$1[redacted]",
-        ),
+      output: redact(r.output.slice(-32000)),
     });
   }
   record?.(results);

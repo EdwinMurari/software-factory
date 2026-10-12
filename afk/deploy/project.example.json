@@ -8,5 +8,17 @@
   "maxRounds": 6,
   "maxTickets": 12,
   "maxConcurrency": 2,
-  "timeoutMs": 1800000
+  "timeoutMs": 1800000,
+  "preflight": {
+    "probes": [
+      {
+        "id": "project-readiness",
+        "command": "/absolute/path/to/readiness-probe",
+        "args": [],
+        "required": false,
+        "timeoutMs": 10000
+      }
+    ],
+    "mcpServers": [{ "name": "berry-brain", "required": false }]
+  }
 }

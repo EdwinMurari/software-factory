@@ -1,8 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, writeFile, readFile, chmod } from "node:fs/promises";
+import { mkdtemp, writeFile, readFile, chmod, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { executeJob } from "../src/engine.js";
 import { command } from "../src/source.js";
 import type { Runtime, RepositoryConfig } from "../src/contracts.js";
@@ -306,6 +306,58 @@ exec /usr/bin/git "$@"
         assert.equal(await readFile(join(target, "base.txt"), "utf8"), mutation === "source" ? "changed" : "base");
       } finally {
         process.env.PATH = originalPath;
+      }
+    });
+  }
+});
+
+test("final accepted commit preserves canonical source and output identity", async (t) => {
+  for (const mutation of ["none", "canonical-source", "canonical-head", "canonical-index", "output-branch", "output-index", "output-history"]) {
+    await t.test(mutation, async () => {
+      const { root, config } = await fixture();
+      let target = "";
+      let repaired = false;
+      const canonicalGit = `env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_PREFIX /usr/bin/git -C '${root}'`;
+      const action = {
+        "none": "exit 0",
+        "canonical-source": `printf changed > '${join(root, "base.txt")}'`,
+        "canonical-head": `${canonicalGit} -c core.hooksPath=/dev/null -c user.name=T -c user.email=t@t commit --allow-empty -m hook`,
+        "canonical-index": `${canonicalGit} update-index --chmod=+x base.txt`,
+        "output-branch": "/usr/bin/git checkout -b hook-output",
+        "output-index": "/usr/bin/git update-index --chmod=+x base.txt",
+        "output-history": 'rewritten=$(/usr/bin/git -c user.name=T -c user.email=t@t commit-tree HEAD^{tree} -m rewritten)\n/usr/bin/git reset --soft "$rewritten"',
+      }[mutation]!;
+      await writeFile(join(root, ".git", "hooks", "post-commit"), `#!/bin/sh\n${action}\n`, { mode: 0o755 });
+      try {
+        const baseline = (await command(root, "git", ["rev-parse", "HEAD"])).output.trim();
+        const run = executeJob("final-commit", "Accept repaired base", "review-repair", config,
+          fake(root, async (req) => {
+            target = req.cwd;
+            if (req.role === "repairer") {
+              await writeFile(join(req.cwd, "base.txt"), "accepted");
+              repaired = true;
+              return JSON.stringify({ status: "done", summary: "Repaired base" });
+            }
+            return JSON.stringify({
+              findings: repaired ? [] : [{ id: "base", file: "base.txt", description: "Base needs repair", repair: "Write accepted" }],
+              blockers: [],
+              coverage: [{ criterion: "Accept repaired base", evidence: "Inspected base", status: "verified" }],
+            });
+          }), () => {}, undefined, baseline);
+        if (mutation === "none") {
+          const result = await run;
+          assert.equal(result.status, "complete");
+          assert.equal(result.branch, "afk/final-commit/integration");
+          assert.equal((await command(target, "git", ["status", "--porcelain"])).output, "");
+          assert.equal(await readFile(join(root, "base.txt"), "utf8"), "base");
+        } else {
+          await assert.rejects(run, /Source (HEAD|Git state|changed)|Committing accepted output/);
+        }
+        assert.equal(repaired, true);
+        assert.equal(await readFile(join(target, "base.txt"), "utf8"), "accepted");
+      } finally {
+        if (target) await rm(dirname(target), { recursive: true, force: true });
+        await rm(root, { recursive: true, force: true });
       }
     });
   }

@@ -38,7 +38,7 @@ Review flows use `--flow review-repair` or `--flow review-only` and require `--b
 
 Runs share the pipeline implementation. Their processes, evidence and output branches are separate. Git worktrees separate source changes; they are not sandboxes. [Sandcastle](https://github.com/mattpocock/sandcastle) executes fresh Codex or Claude sessions with `noSandbox()` on the host.
 
-A run can wait for its own ticket dependencies. It does not wait for another factory user. Integration remains ordered within each run. Output stays in a retained branch/worktree; the pipeline has no push, source-checkout merge or deployment step.
+A run can wait for its own ticket dependencies. It does not wait for another factory user. Integration remains ordered within each run. Output stays in a retained branch/worktree. A run never merges, pushes or deploys. `berry-afk merge RUN` is a separate, explicitly authorized step that verifies the result, updates **local** `main` only and cleans the run's owned worktrees; there is no push or deploy step. See the [run guide](afk/README.md).
 
 One run targets one clean repository. Whole-codebase review scope must be explicit; the factory gives no automatic per-module coverage guarantee. Product decisions happen during intake. Missing requirements and integration conflicts remain explicit limitations or incomplete work.
 

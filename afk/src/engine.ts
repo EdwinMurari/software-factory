@@ -4,8 +4,20 @@ import type {
   Flow,
   EvidenceSink,
 } from "./contracts.js";
-import { Incomplete, Blocked } from "./contracts.js";
-import { plan, implement, reviewRepair, integrate, publish } from "./steps.js";
+import {
+  Incomplete,
+  Blocked,
+  type TicketProvenance,
+  type RunProvenance,
+} from "./contracts.js";
+import {
+  plan,
+  implement,
+  reviewRepair,
+  integrate,
+  publish,
+  commitAccepted,
+} from "./steps.js";
 import { command, sourceHash, gitState } from "./source.js";
 export async function executeJob(
   id: string,
@@ -20,7 +32,7 @@ export async function executeJob(
   const dirty = await command(
     config.root,
     "git",
-    ["status", "--porcelain"],
+    ["status", "--porcelain", "--untracked-files=all"],
     signal,
   );
   if (dirty.code || dirty.output.trim())
@@ -51,6 +63,7 @@ export async function executeJob(
   );
   sink("worktree", { path: target });
   let acceptance: string[] | undefined;
+  const provenance: TicketProvenance[] = [];
   if (flow === "build") {
     const plannerGit = await gitState(target, signal);
     const plannerHash = await sourceHash(target, signal);
@@ -117,7 +130,7 @@ export async function executeJob(
             ticket,
             ticket.acceptance,
           );
-          return { ticket, cwd, ticketHead };
+          return { ticket, cwd, ticketHead, branch: `afk/${id}/${ticket.id}` };
         }),
       );
       for (const result of completed) {
@@ -129,6 +142,14 @@ export async function executeJob(
           signal,
         );
         sink("integrate", { ticket: result.value.ticket.id, integrated });
+        provenance.push({
+          id: result.value.ticket.id,
+          branch: result.value.branch,
+          worktree: result.value.cwd,
+          base: result.value.ticketHead,
+          head: integrated.head,
+          picks: integrated.picks,
+        });
         done.add(result.value.ticket.id);
       }
     }
@@ -164,16 +185,16 @@ export async function executeJob(
     acceptance,
     controllerEvidence,
   );
-  if (
-    (
-      await command(config.root, "git", ["rev-parse", "HEAD"], signal)
-    ).output.trim() !== head.output.trim()
-  )
-    throw new Incomplete("Source HEAD changed during job");
-  if ((await sourceHash(config.root, signal)) !== initial)
-    throw new Incomplete("Source changed during job");
-  if ((await gitState(config.root, signal)) !== sourceGit)
-    throw new Incomplete("Source Git state changed during job");
+  const verifyCanonicalSource = async () => {
+    const currentHead = await command(config.root, "git", ["rev-parse", "HEAD"], signal);
+    if (currentHead.code || currentHead.output.trim() !== head.output.trim())
+      throw new Incomplete("Source HEAD changed during job");
+    if ((await sourceHash(config.root, signal)) !== initial)
+      throw new Incomplete("Source changed during job");
+    if ((await gitState(config.root, signal)) !== sourceGit)
+      throw new Incomplete("Source Git state changed during job");
+  };
+  await verifyCanonicalSource();
   const published = await publish(target, signal);
   // Publication must retain the exact source and Git state accepted by review.
   // Keep the checked hash authoritative; never replace it with a later sample.
@@ -186,5 +207,42 @@ export async function executeJob(
   )
     throw new Incomplete("Publication changed source");
   signal?.throwIfAborted();
-  return { ...published, ...verified };
+  const acceptedHead = await command(target, "git", ["rev-parse", "HEAD"], signal);
+  if (acceptedHead.code) throw new Incomplete("Cannot read accepted output HEAD");
+  // Reviewed repairs are uncommitted. Commit them so the output is a Git commit.
+  const outputHead =
+    flow === "review-only"
+      ? acceptedHead.output.trim()
+      : await commitAccepted(target, signal);
+  if ((await sourceHash(target, signal)) !== verified.sourceHash)
+    throw new Incomplete("Committing accepted output changed source");
+  const finalBranch = await command(target, "git", ["branch", "--show-current"], signal);
+  const finalHead = await command(target, "git", ["rev-parse", "HEAD"], signal);
+  const finalStatus = await command(target, "git", ["status", "--porcelain", "--untracked-files=all"], signal);
+  const retainedHistory = await command(target, "git", [
+    "merge-base", "--is-ancestor", acceptedHead.output.trim(), outputHead,
+  ], signal);
+  if (
+    finalBranch.code || finalBranch.output.trim() !== published.branch ||
+    finalHead.code || finalHead.output.trim() !== outputHead ||
+    finalStatus.code || finalStatus.output.trim() || retainedHistory.code
+  )
+    throw new Incomplete("Committing accepted output changed its identity, history or clean state");
+  // Commit hooks run with host access, so recheck the canonical repository last.
+  await verifyCanonicalSource();
+  signal?.throwIfAborted();
+  return {
+    ...published,
+    ...verified,
+    provenance: {
+      version: 1,
+      runId: id,
+      repository: config.root,
+      flow,
+      baseline: head.output.trim(),
+      outputHead,
+      integration: { branch: published.branch, worktree: target },
+      tickets: provenance,
+    } satisfies RunProvenance,
+  };
 }

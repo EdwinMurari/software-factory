@@ -12,15 +12,18 @@ import {
   symlink,
   stat,
   chmod,
+  copyFile,
+  readdir,
 } from "node:fs/promises";
 import { execFileSync, spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { validateConfig } from "../src/config.js";
-import { mergeRun, reconcileRun } from "../src/delivery.js";
+import { mergeRun, ownerProblem, reconcileRun } from "../src/delivery.js";
 import { runInstance, type RunRecord } from "../src/run.js";
 import { runCli } from "../src/cli.js";
-import type { Runtime, RunProvenance } from "../src/contracts.js";
+import { createRuntime } from "../src/runtime.js";
+import type { CheckEvidence, Runtime, RunProvenance } from "../src/contracts.js";
 import { installProviders } from "./provider.js";
 import { hash } from "../src/source.js";
 
@@ -87,14 +90,12 @@ async function world() {
     timeoutMs: 600000,
   });
   const behavior: Behavior = {};
-  // Real Git worktrees in the same layout as Sandcastle: nested under their parent.
+  const nativeRuntime = createRuntime();
   const runtime: Runtime = {
     async createWorktree(from, branch) {
-      const path = join(from, ".sandcastle", "worktrees", branch.replaceAll("/", "__"));
-      await mkdir(join(from, ".sandcastle", "worktrees"), { recursive: true });
-      git(from, "worktree", "add", "-q", "-b", branch, path);
+      const path = await nativeRuntime.createWorktree(from, branch);
       if (branch.includes("/delivery-")) behavior.onCandidate?.();
-      return realpath(path);
+      return path;
     },
     async removeWorktree() {},
     async execute(request) {
@@ -408,6 +409,46 @@ withWorld("incomplete, tampered, stale, dirty and legacy results are rejected", 
   const dirty = await reconcileRun(dir, options(w));
   assert.equal(dirty.status, "merge-failed", "reconcile never merges");
   assert.equal(await readFile(join(w.repo, "stray.txt"), "utf8"), "user work\n");
+});
+
+withWorld("delivery requires one passing result for every configured check", async (w) => {
+  w.config.checks.push({ ...w.config.checks[0]!, id: "second-required-check" });
+  const run = await build(w);
+  const dir = run.runDirectory;
+  const saved = await readFile(join(dir, "result.json"), "utf8");
+  const mainBefore = git(w.repo, "rev-parse", "main");
+  const treesBefore = trees(w.repo);
+  const branchesBefore = branches(w.repo);
+  const mutations: [string, (checks: CheckEvidence[]) => unknown][] = [
+    ["missing required check", (checks) => checks.slice(0, 1)],
+    ["duplicate check replacing required check", (checks) => [checks[0], checks[0]]],
+    ["unknown check replacing required check", (checks) => [checks[0], { ...checks[1], id: "unknown" }]],
+    ["extra result", (checks) => [...checks, checks[0]]],
+    ["missing check ID", (checks) => [checks[0], { ...checks[1], id: undefined }]],
+    ["malformed result", (checks) => [checks[0], null]],
+    ["stale source", (checks) => [checks[0], { ...checks[1], sourceHash: "stale" }]],
+    ["failed check", (checks) => [checks[0], { ...checks[1], exitCode: 1 }]],
+  ];
+  for (const [name, mutate] of mutations) {
+    for (const file of ["result.json", "status.json"]) await writeFile(join(dir, file), saved);
+    await rewriteRun(dir, (record) => {
+      const result = record.result as { checks: CheckEvidence[] };
+      result.checks = mutate(result.checks) as CheckEvidence[];
+    });
+    const result = await mergeRun(dir, options(w));
+    assert.equal(result.status, "merge-failed", `${name}: ${JSON.stringify(result)}`);
+    assert.match(result.reason!, /check and review evidence/, name);
+    assert.equal(git(w.repo, "rev-parse", "main"), mainBefore, name);
+    assert.deepEqual(trees(w.repo), treesBefore, name);
+    assert.deepEqual(branches(w.repo), branchesBefore, name);
+  }
+  for (const file of ["result.json", "status.json"]) await writeFile(join(dir, file), saved);
+  await rewriteRun(dir, (record) => {
+    (record.result as { checks: CheckEvidence[] }).checks.reverse();
+  });
+  const delivered = await mergeRun(dir, options(w));
+  assert.match(delivered.status, /^merged-cleanup-/, JSON.stringify(delivered));
+  assert.ok(included(w.repo, run.provenance.outputHead));
 });
 
 withWorld("incomplete runs cannot merge", async (w) => {
@@ -811,7 +852,10 @@ withWorld("an interrupted candidate registration remains visible and retained on
   assert.equal(receipt.candidates.length, 1);
   const intent = receipt.candidates[0];
   assert.equal(intent.worktree, undefined);
-  const unknownTree = join(w.repo, ".sandcastle", "worktrees", intent.branch.replaceAll("/", "__"));
+  const unknownTree = trees(w.repo).find(
+    (path) => git(path, "symbolic-ref", "HEAD") === `refs/heads/${intent.branch}`,
+  );
+  assert.ok(unknownTree, "interrupted candidate remains registered with Git");
   await writeFile(join(unknownTree, "user.txt"), "unknown ownership\n");
   w.behavior.onCandidate = undefined;
   const retry = await mergeRun(run.runDirectory, options(w));
@@ -858,6 +902,86 @@ withWorld("candidate checks stop at the configured verification deadline", async
     if (alive) await new Promise((resolve) => setTimeout(resolve, 20));
   }
   assert.equal(alive, false, "timed-out check process was stopped");
+});
+
+test("owner inspection rechecks exited processes, preserves live owners and respects cancellation", { skip: process.platform !== "linux" || process.getuid?.() === 0, timeout: 10000 }, async (t) => {
+  for (const scenario of ["exited", "another owner", "still inaccessible", "cancelled"] as const) {
+    await t.test(scenario, async () => {
+      const root = await realpath(await mkdtemp(join(tmpdir(), "afk-owner-")));
+      const children: { child: ReturnType<typeof spawn>; exited: Promise<void> }[] = [];
+      const start = async (nonDumpable: boolean, cwd: string) => {
+        const child = spawn("python3", ["-c", `import ctypes,time; ${nonDumpable ? "assert ctypes.CDLL(None).prctl(4,0,0,0,0)==0; " : ""}print('ready',flush=True); time.sleep(90)`],
+          { cwd, stdio: ["ignore", "pipe", "inherit"] });
+        const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
+        const owner = { child, exited };
+        children.push(owner);
+        await new Promise<void>((resolve, reject) => {
+          child.stdout!.once("data", () => resolve());
+          child.once("error", reject);
+          child.once("exit", () => reject(new Error("owner fixture exited early")));
+        });
+        return owner;
+      };
+      const stop = async (owner: (typeof children)[number]) => {
+        if (owner.child.exitCode === null && owner.child.signalCode === null) owner.child.kill("SIGKILL");
+        await owner.exited;
+      };
+      try {
+        const unknown = await start(true, tmpdir());
+        await assert.rejects(readlink(`/proc/${unknown.child.pid}/cwd`), (error: NodeJS.ErrnoException) => ["EACCES", "EPERM"].includes(error.code!));
+        if (scenario === "another owner") await start(false, root);
+        const controller = new AbortController();
+        // Inspection reaches the real permission denial before its first await.
+        const inspection = ownerProblem(root, controller.signal);
+        if (scenario === "cancelled") {
+          controller.abort();
+          await assert.rejects(inspection, { name: "AbortError" });
+        } else if (scenario === "still inaccessible") {
+          assert.match((await inspection)!, /owner cannot be inspected/);
+          assert.equal(unknown.child.exitCode, null);
+          assert.equal(unknown.child.signalCode, null);
+        } else {
+          await stop(unknown);
+          assert.equal(await inspection, scenario === "exited" ? null : "active process is using the worktree");
+        }
+      } finally {
+        await Promise.all(children.map(stop));
+        await rm(root, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test("a running tracked executable retains its worktree while cwd and descriptors are elsewhere", { skip: process.platform !== "linux", timeout: 10000 }, async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "afk-executable-owner-")));
+  let child: ReturnType<typeof spawn> | undefined;
+  try {
+    const tree = join(root, "worktree");
+    await mkdir(tree);
+    git(tree, "init", "-q", "-b", "main");
+    const executable = join(tree, "sleep");
+    await copyFile("/bin/sleep", executable);
+    git(tree, "add", "sleep");
+    git(tree, "commit", "-q", "-m", "tracked executable");
+    child = spawn(executable, ["60"], { cwd: root, stdio: "ignore" });
+    await new Promise<void>((resolve, reject) => {
+      child!.once("spawn", resolve);
+      child!.once("error", reject);
+    });
+    assert.equal(await readlink(`/proc/${child.pid}/cwd`), root);
+    assert.equal(await readlink(`/proc/${child.pid}/exe`), executable);
+    for (const fd of await readdir(`/proc/${child.pid}/fd`))
+      assert.ok(!(await readlink(`/proc/${child.pid}/fd/${fd}`)).startsWith(tree));
+    assert.equal(git(tree, "status", "--porcelain", "--untracked-files=all"), "");
+    assert.equal(await ownerProblem(tree), "active process is using the worktree");
+  } finally {
+    if (child && child.exitCode === null && child.signalCode === null) {
+      const exited = new Promise((resolve) => child!.once("exit", resolve));
+      child.kill("SIGKILL");
+      await exited;
+    }
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("a same-user non-dumpable Linux owner prevents worktree deletion", { skip: process.platform !== "linux" || process.getuid?.() === 0, timeout: 120000 }, async () => {

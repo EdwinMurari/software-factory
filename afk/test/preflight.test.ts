@@ -18,6 +18,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { validateConfig } from "../src/config.js";
 import { preflight, type PreflightReport } from "../src/preflight.js";
+import { createRuntime } from "../src/runtime.js";
 import { installProviders } from "./provider.js";
 
 async function fixture(provider: "codex" | "claude" = "codex", extra = {}) {
@@ -147,6 +148,113 @@ test("real filesystem write failures block: provider home and run-owned output",
     assert.equal(missingHome.status, "blocked");
   } finally {
     await chmod(f.providers.CODEX_HOME, 0o700).catch(() => {});
+    await cleanup(f.root);
+  }
+});
+
+test("read-only runtime metadata blocks readiness before work begins", async () => {
+  if (process.getuid?.() === 0) return;
+  const f = await fixture("claude");
+  const metadata = join(f.repo, ".git", "berry-afk", "metadata");
+  try {
+    await mkdir(metadata, { recursive: true });
+    await chmod(metadata, 0o500);
+    const report = await f.run();
+    assert.equal(cap(report, "writable:state")?.state, "observed", "the parent is writable");
+    assert.equal(report.status, "blocked", "existing metadata must be writable");
+    for (const name of ["worktrees", "logs", "patches"])
+      assert.equal(cap(report, `writable:metadata:${name}`)?.state, "unavailable");
+    assert.deepEqual(await readdir(metadata), [], "inspection creates no metadata");
+  } finally {
+    await chmod(metadata, 0o700).catch(() => {});
+    await cleanup(f.root);
+  }
+});
+
+test("readiness checks actual metadata leaves and in-metadata worktree directories", async () => {
+  if (process.getuid?.() === 0) return;
+  const f = await fixture("claude");
+  const runtime = createRuntime({ provider: "claude", model: "fixture" });
+  const restore: string[] = [];
+  try {
+    const worktree = await runtime.createWorktree(f.repo, "afk/readiness/integration");
+    for (const name of ["worktrees", "logs", "patches"]) {
+      const target = await realpath(join(f.repo, ".sandcastle", name));
+      restore.push(target);
+      await chmod(target, 0o500);
+      const report = await f.run();
+      assert.equal(report.status, "blocked", name);
+      assert.equal(cap(report, `writable:metadata:${name}`)?.state, "unavailable");
+      await chmod(target, 0o700);
+    }
+    assert.equal((await f.run()).status, "ready");
+    // Runtime skips external links inside its metadata root. Sandcastle uses these local paths.
+    const localLogs = join(worktree, ".sandcastle", "logs");
+    await mkdir(localLogs, { recursive: true });
+    restore.push(localLogs);
+    await chmod(localLogs, 0o500);
+    const config = await validateConfig({ ...f.raw, root: worktree });
+    const report = await preflight(config, {
+      mode: "inspect", env: f.env, home: f.root, timeoutMs: 20000,
+    });
+    assert.equal(report.status, "blocked");
+    assert.equal(cap(report, "writable:metadata:logs")?.state, "unavailable");
+    assert.match(cap(report, "writable:metadata:logs")!.evidence, /EACCES/);
+  } finally {
+    for (const path of restore) await chmod(path, 0o700).catch(() => {});
+    await cleanup(f.root);
+  }
+});
+
+test("metadata preparation blocks missing links in a read-only directory", async () => {
+  if (process.getuid?.() === 0) return;
+  const f = await fixture("claude");
+  const sandcastle = join(f.repo, ".sandcastle");
+  try {
+    await mkdir(sandcastle);
+    await chmod(sandcastle, 0o500);
+    const report = await f.run();
+    assert.equal(report.status, "blocked");
+    assert.equal(cap(report, "writable:metadata-links")?.state, "unavailable");
+    assert.deepEqual(await readdir(sandcastle), []);
+  } finally {
+    await chmod(sandcastle, 0o700).catch(() => {});
+    await cleanup(f.root);
+  }
+});
+
+test("metadata preparation requires writable excludes only when patterns are missing", async () => {
+  if (process.getuid?.() === 0) return;
+  const f = await fixture("claude");
+  const exclude = join(f.repo, ".git", "info", "exclude");
+  const sandcastle = join(f.repo, ".sandcastle");
+  try {
+    const original = await readFile(exclude, "utf8");
+    await chmod(exclude, 0o400);
+    const report = await f.run();
+    assert.equal(report.status, "blocked");
+    assert.equal(cap(report, "writable:metadata-exclude")?.state, "unavailable");
+    assert.equal(await readFile(exclude, "utf8"), original);
+    await chmod(exclude, 0o600);
+    await rm(exclude);
+    await chmod(dirname(exclude), 0o500);
+    const missing = await f.run();
+    assert.equal(missing.status, "blocked");
+    assert.equal(cap(missing, "writable:metadata-exclude")?.state, "unavailable");
+    assert.equal(existsSync(exclude), false);
+    await chmod(dirname(exclude), 0o700);
+    await writeFile(exclude, original, { mode: 0o600 });
+    const runtime = createRuntime({ provider: "claude", model: "fixture" });
+    await runtime.createWorktree(f.repo, "afk/readiness/prepared");
+    await chmod(sandcastle, 0o500);
+    await chmod(exclude, 0o400);
+    const prepared = await f.run();
+    assert.equal(prepared.status, "ready", JSON.stringify(prepared.blockers));
+    await runtime.createWorktree(f.repo, "afk/readiness/prepared-again");
+  } finally {
+    await chmod(dirname(exclude), 0o700).catch(() => {});
+    await chmod(exclude, 0o600).catch(() => {});
+    await chmod(sandcastle, 0o700).catch(() => {});
     await cleanup(f.root);
   }
 });

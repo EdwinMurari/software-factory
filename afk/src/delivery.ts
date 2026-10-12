@@ -10,9 +10,11 @@ import {
   lstatSync,
 } from "node:fs";
 import { basename, join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import {
   Incomplete,
   parseReview,
+  type CheckEvidence,
   type Review,
   type RepositoryConfig,
   type RunProvenance,
@@ -81,7 +83,7 @@ interface Loaded {
   provenance: RunProvenance;
   result: {
     sourceHash: string;
-    checks: { exitCode: number; sourceHash: string }[];
+    checks: Pick<CheckEvidence, "id" | "exitCode" | "sourceHash">[];
     review: Review;
   };
 }
@@ -212,12 +214,15 @@ async function load(directory: string): Promise<Loaded> {
   )
     fail("Run provenance does not match run identity");
   result.review = parseReview(JSON.stringify(result.review));
+  const requiredCheckIds = new Set(config.checks.map((check) => check.id));
   if (
     !Array.isArray(result.checks) ||
-    !result.checks.length ||
+    result.checks.length !== requiredCheckIds.size ||
     result.checks.some(
-      (c) => c.exitCode !== 0 || c.sourceHash !== result.sourceHash,
+      (c) => !c || typeof c !== "object" || !requiredCheckIds.has(c.id) ||
+        c.exitCode !== 0 || c.sourceHash !== result.sourceHash,
     ) ||
+    new Set(result.checks.map((check) => check.id)).size !== requiredCheckIds.size ||
     result.review.findings.length !== 0 ||
     result.review.blockers.length !== 0 ||
     !result.review.coverage.length ||
@@ -425,7 +430,19 @@ async function validateCandidate(candidate: Candidate, acceptedHash: string, out
 }
 
 /** Inspect owners; unavailable evidence is not proof that a worktree is idle. */
-function ownerProblem(path: string): string | null {
+export async function ownerProblem(path: string, signal?: AbortSignal): Promise<string | null> {
+  for (let attempt = 0; ; attempt++) {
+    signal?.throwIfAborted();
+    const problem = scanOwners(path);
+    if (problem !== "potential process owner cannot be inspected" || attempt === 2) return problem;
+    // Linux can deny /proc access while a same-user process exits. Give it a
+    // bounded chance to disappear, then inspect every owner again. A process
+    // that stays inaccessible still blocks removal.
+    await delay(10, undefined, { signal });
+  }
+}
+
+function scanOwners(path: string): string | null {
   if (process.platform !== "linux") return "owner inspection is unavailable on this platform";
   let pids: string[];
   try {
@@ -437,6 +454,8 @@ function ownerProblem(path: string): string | null {
     try {
       const cwd = readlinkSync(`/proc/${pid}/cwd`);
       if (cwd === path || isWithin(path, cwd)) return "active process is using the worktree";
+      const executable = readlinkSync(`/proc/${pid}/exe`);
+      if (executable === path || isWithin(path, executable)) return "active process is using the worktree";
       for (const fd of readdirSync(`/proc/${pid}/fd`)) {
         let target: string;
         try {
@@ -606,7 +625,7 @@ async function removeWorktree(
   if (listed.head !== o.head) return "head changed since the run recorded it";
   const proof = await included(root, o, signal);
   if (proof) return proof;
-  const owner = ownerProblem(path);
+  const owner = await ownerProblem(path, signal);
   if (owner) return owner;
   if (registered.some((w) => w.path !== path && isWithin(path, w.path)) ||
       retainedPaths.some((child) => isWithin(path, child)))

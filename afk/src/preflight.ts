@@ -5,7 +5,7 @@ import { constants } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import type { RepositoryConfig } from "./contracts.js";
-import { repositoryStateRoot, resolveStageGuidance } from "./runtime.js";
+import { repositoryStateRoot, resolveStageGuidance, metadataPreparation } from "./runtime.js";
 import {
   command,
   pinCheck,
@@ -159,12 +159,20 @@ async function nearestExisting(path: string): Promise<string> {
   }
 }
 /** Probe writes happen only in run-owned directories; elsewhere the kernel answers access(). */
-async function writable(path: string, owned: boolean): Promise<string | null> {
+async function writable(path: string, owned: boolean, file = false): Promise<string | null> {
   try {
     const target = await nearestExisting(path);
-    if (!(await stat(target)).isDirectory()) return "not a directory";
-    if (!owned) {
+    const info = await stat(target);
+    if (file && target !== resolve(path) && target !== dirname(resolve(path)))
+      return "parent directory does not exist";
+    if (file && target === resolve(path)) {
+      if (!info.isFile()) return "not a file";
       await access(target, constants.W_OK);
+      return null;
+    }
+    if (!info.isDirectory()) return "not a directory";
+    if (!owned) {
+      await access(target, constants.W_OK | constants.X_OK);
       return null;
     }
     const probe = join(target, `.berry-afk-probe-${randomUUID()}`);
@@ -254,6 +262,23 @@ export async function preflight(
   const beforeGit = await gitState(config.root, signal);
 
   const stateRoot = await repositoryStateRoot(config.root);
+  try {
+    const metadata = await metadataPreparation(config.root, join(stateRoot, "metadata"));
+    for (const { name, target } of metadata.directories) {
+      const problem = await writable(target, false);
+      seen(`writable:metadata:${name}`, !problem, problem ?? "writable");
+    }
+    if (metadata.needsLinks) {
+      const problem = await writable(metadata.sandcastle, false);
+      seen("writable:metadata-links", !problem, problem ?? "writable");
+    }
+    if (metadata.exclude?.missing.length) {
+      const problem = await writable(metadata.exclude.path, false, true);
+      seen("writable:metadata-exclude", !problem, problem ?? "writable");
+    }
+  } catch (error) {
+    seen("metadata:preparation", false, errorText(error));
+  }
   for (const [id, path, owned] of [
     ["writable:state", stateRoot, false],
     ...(options.mode === "startup" && options.runDirectory

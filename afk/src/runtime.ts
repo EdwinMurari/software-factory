@@ -140,67 +140,81 @@ export async function repositoryStateRoot(repo: string): Promise<string> {
   return join(await realpath(resolve(repo, stdout.trim())), "berry-afk");
 }
 
-async function prepareMetadata(repo: string, root: string): Promise<void> {
-  const canonical = await realpath(repo),
-    metadataRoot = resolve(root);
-  if (isWithin(metadataRoot, canonical)) return;
-  // Local Git excludes do not alter tracked source or existing Sandcastle config.
-  const git = promisify(execFile);
-  const { stdout } = await git(
-    "git",
-    ["rev-parse", "--git-path", "info/exclude"],
-    { cwd: canonical },
+/** One path layout for runtime creation and read-only readiness checks. */
+export async function runtimeMetadata(repo: string, root?: string) {
+  const canonical = await realpath(repo);
+  const metadataRoot = resolve(root ?? join(await repositoryStateRoot(repo), "metadata"));
+  const external = !isWithin(metadataRoot, canonical);
+  const id = createHash("sha256").update(canonical).digest("hex");
+  const sandcastle = join(canonical, ".sandcastle");
+  const directories = ["worktrees", "logs", "patches"].map((name) => ({
+    name,
+    link: join(sandcastle, name),
+    target: external ? join(metadataRoot, name, id) : join(sandcastle, name),
+  }));
+  return { canonical, external, sandcastle, directories };
+}
+
+async function missingMetadataLink(link: string, target: string): Promise<boolean> {
+  try {
+    const existing = await lstat(link);
+    if (!existing.isSymbolicLink() || resolve(dirname(link), await readlink(link)) !== target)
+      throw new Incomplete("Existing Sandcastle metadata path requires operator review");
+    return false;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    return true;
+  }
+}
+
+/** Inspect the exact preparation work without creating directories, links or excludes. */
+export async function metadataPreparation(repo: string, root?: string) {
+  const layout = await runtimeMetadata(repo, root);
+  const { canonical, external, sandcastle, directories } = layout;
+  if (!external) return { ...layout, exclude: undefined, needsLinks: false };
+  try {
+    if (!(await lstat(sandcastle)).isDirectory())
+      throw new Incomplete("Foreign Sandcastle metadata directory");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  const { stdout } = await promisify(execFile)(
+    "git", ["rev-parse", "--git-path", "info/exclude"], { cwd: canonical },
   );
-  const exclude = resolve(canonical, stdout.trim());
-  const content = await readFile(exclude, "utf8").catch((error) => {
+  const path = resolve(canonical, stdout.trim());
+  const content = await readFile(path, "utf8").catch((error) => {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return "";
     throw error;
   });
-  const paths = [
-    "/.sandcastle/worktrees",
-    "/.sandcastle/logs",
-    "/.sandcastle/patches",
-  ];
-  const missing = paths.filter((path) => !content.split("\n").includes(path));
-  if (missing.length)
-    await appendFile(exclude, "\n" + missing.join("\n") + "\n", {
+  const missing = directories.map(({ name }) => `/.sandcastle/${name}`)
+    .filter((entry) => !content.split("\n").includes(entry));
+  let needsLinks = false;
+  for (const { link, target } of directories)
+    if (await missingMetadataLink(link, target)) needsLinks = true;
+  return { ...layout, exclude: { path, missing }, needsLinks };
+}
+
+async function prepareMetadata(repo: string, root: string): Promise<void> {
+  const { external, sandcastle, directories, exclude } = await metadataPreparation(repo, root);
+  if (!external) return;
+  // Local Git excludes do not alter tracked source or existing Sandcastle config.
+  if (exclude?.missing.length)
+    await appendFile(exclude.path, "\n" + exclude.missing.join("\n") + "\n", {
       mode: 0o600,
     });
-  const id = createHash("sha256").update(canonical).digest("hex");
-  const sandcastle = join(canonical, ".sandcastle");
   await mkdir(sandcastle, { recursive: true });
-  if ((await lstat(sandcastle)).isSymbolicLink())
+  if (!(await lstat(sandcastle)).isDirectory())
     throw new Incomplete("Foreign Sandcastle metadata directory");
-  for (const name of ["worktrees", "logs", "patches"]) {
-    const target = join(metadataRoot, name, id),
-      link = join(sandcastle, name);
+  for (const { target, link } of directories) {
     await mkdir(target, { recursive: true, mode: 0o700 });
+    if (!(await missingMetadataLink(link, target))) continue;
     try {
-      const existing = await lstat(link);
-      if (
-        !existing.isSymbolicLink() ||
-        resolve(dirname(link), await readlink(link)) !== target
-      ) {
-        throw new Incomplete(
-          "Existing Sandcastle metadata path requires operator review",
-        );
-      }
+      await symlink(target, link, "dir");
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      try {
-        await symlink(target, link, "dir");
-      } catch (creationError) {
-        if ((creationError as NodeJS.ErrnoException).code !== "EEXIST")
-          throw creationError;
-        // A concurrent run may have created the same stable link.
-        if (
-          !(await lstat(link)).isSymbolicLink() ||
-          resolve(dirname(link), await readlink(link)) !== target
-        )
-          throw new Incomplete(
-            "Existing Sandcastle metadata path requires operator review",
-          );
-      }
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      // A concurrent run may have created the same stable link.
+      if (await missingMetadataLink(link, target))
+        throw new Incomplete("Existing Sandcastle metadata path requires operator review");
     }
   }
 }

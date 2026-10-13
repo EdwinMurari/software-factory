@@ -2,6 +2,8 @@
 
 Every `run` invocation executes the shared pipeline in its own process. There is no scheduler, pool, queue, API socket or resident service. Any coding agent can invoke the same CLI. Each worker call uses pinned Sandcastle 0.12.0 and a fresh Codex or Claude session with `noSandbox()`.
 
+Codex workers use “Approve for me”: `on-request` approvals, `auto_review`, and Codex's native `workspace-write` permissions. Sandcastle still runs directly on the host without a container. A small adapter overrides Sandcastle 0.12.0's forced full-access flag; an unexpected upstream command fails closed. Auto-review handles eligible approval requests, not every action. Denied requests can still block a run. Claude's permission mode is unchanged.
+
 ## Configure a project
 
 Copy [project.example.json](deploy/project.example.json) to a project-owned configuration file. Set the absolute canonical repository root, standards, trusted checks, provider/model and limits. On Berry, keep configuration under `/srv/appdata/berry/config/software-factory/` and run evidence under `/srv/appdata/berry/state/services/software-factory/runs/`. A config belongs to one project; it is not a central registry. Reuse the same file for independent invocations.

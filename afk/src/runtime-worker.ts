@@ -1,5 +1,6 @@
-import { codex, claudeCode, run, Output } from "@ai-hero/sandcastle";
+import { claudeCode, run, Output } from "@ai-hero/sandcastle";
 import { noSandbox } from "@ai-hero/sandcastle/sandboxes/no-sandbox";
+import { codexAutoReview } from "./codex-agent.js";
 import type { RuntimeConfig } from "./runtime.js";
 import type { AgentRequest } from "./contracts.js";
 
@@ -26,7 +27,7 @@ process.once(
               captureSessions: false,
               permissionMode: "bypassPermissions",
             })
-          : codex(config.model!, {
+          : codexAutoReview(config.model!, {
               effort: config.effort ?? "high",
               captureSessions: false,
             });

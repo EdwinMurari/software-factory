@@ -45,7 +45,7 @@ test("actual Sandcastle library manages execution, failures and worktrees", asyn
     const shim = join(bin, "codex");
     await writeFile(
       shim,
-      '#!/bin/sh\ncat >/dev/null\nprintf \'%s\\n\' \'{"type":"item.completed","item":{"type":"agent_message","text":"<berry_result>{\\"status\\":\\"done\\",\\"summary\\":\\"fixture\\"}</berry_result>"}}\'\n',
+      '#!/bin/sh\nprintf \'%s\\n\' "$@" > "$(dirname "$0")/codex-args"\ncat >/dev/null\nprintf \'%s\\n\' \'{"type":"item.completed","item":{"type":"agent_message","text":"<berry_result>{\\"status\\":\\"done\\",\\"summary\\":\\"fixture\\"}</berry_result>"}}\'\n',
       { mode: 0o700 },
     );
     const runtime = createRuntime({ stateRoot: join(root, "state") });
@@ -58,6 +58,12 @@ test("actual Sandcastle library manages execution, failures and worktrees", asyn
       status: "done",
       summary: "fixture",
     });
+    const args = (await readFile(join(bin, "codex-args"), "utf8")).trim().split("\n");
+    assert.equal(args[args.indexOf("-a") + 1], "on-request");
+    assert.ok(args.indexOf("-a") < args.indexOf("exec"));
+    assert.equal(args[args.indexOf("-s") + 1], "workspace-write");
+    assert.ok(args.includes('approvals_reviewer="auto_review"'));
+    assert.ok(!args.some((arg) => /danger|full-auto|yolo/.test(arg)));
     const worktree = await runtime.createWorktree(repo, "afk/fixture/ticket");
     assert.ok(
       worktree.startsWith(await realpath(join(root, "state", "worktrees"))),

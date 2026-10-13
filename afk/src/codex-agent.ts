@@ -8,7 +8,7 @@ export function codexAutoReview(model: string, options: CodexOptions = {}) {
       const invocation = provider.buildPrintCommand(args);
       // Sandcastle 0.12.0 forces full access for auto-review. Keep its adapter,
       // but retain Codex's workspace boundary so escalations reach the reviewer.
-      // The approval policy is a global CLI option, before the exec subcommand.
+      // Set the policy through exec's config; its CLI does not accept -a.
       const prefix = "codex exec --json -a on-request -s danger-full-access ";
       if (!invocation.command.startsWith(prefix)) {
         throw new Error("Unexpected Sandcastle Codex approval command");
@@ -16,7 +16,7 @@ export function codexAutoReview(model: string, options: CodexOptions = {}) {
       return {
         ...invocation,
         command:
-          "codex -a on-request exec --json -s workspace-write " +
+          "codex exec --json -c 'approval_policy=\"on-request\"' -s workspace-write " +
           invocation.command.slice(prefix.length),
       };
     },

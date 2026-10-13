@@ -59,8 +59,8 @@ test("actual Sandcastle library manages execution, failures and worktrees", asyn
       summary: "fixture",
     });
     const args = (await readFile(join(bin, "codex-args"), "utf8")).trim().split("\n");
-    assert.equal(args[args.indexOf("-a") + 1], "on-request");
-    assert.ok(args.indexOf("-a") < args.indexOf("exec"));
+    assert.ok(args.includes('approval_policy="on-request"'));
+    assert.ok(!args.includes("-a"));
     assert.equal(args[args.indexOf("-s") + 1], "workspace-write");
     assert.ok(args.includes('approvals_reviewer="auto_review"'));
     assert.ok(!args.some((arg) => /danger|full-auto|yolo/.test(arg)));
